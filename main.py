@@ -151,9 +151,10 @@ class MarioNet(nn.Module):
             conv3,
             nn.ReLU(),
             nn.Flatten(),
+            SelfAttentionLayer(embed_dim=linear_input_size, num_heads=8),
+            nn.Hardswish(),
             nn.Linear(linear_input_size, 512),
             nn.Hardtanh(),
-            SelfAttentionLayer(embed_dim=512, num_heads=8),
             nn.Linear(512, output_dim),
         )
 
@@ -278,7 +279,7 @@ class MarioB:
 
         self.exploration_rate = 1
         self.exploration_rate_decay = 0.98
-        self.exploration_rate_min = 0.15
+        self.exploration_rate_min = 0.1
         self.curr_step = 0
 
         self.save_every = 5e5  # no. of experiences between saving Mario Net
