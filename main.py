@@ -105,9 +105,9 @@ class MarioNet(nn.Module):
         super().__init__()
         c, h, w = input_dim
 
-        self.online = self.__build_cnn(c, output_dim)
+        self.online = self.__build_cnn(c, h, w, output_dim)
 
-        self.target = self.__build_cnn(c, output_dim)
+        self.target = self.__build_cnn(c, h, w, output_dim)
         self.target.load_state_dict(self.online.state_dict())
 
         # Q_target parameters are frozen.
@@ -120,18 +120,35 @@ class MarioNet(nn.Module):
         elif model == "target":
             return self.target(input)
 
-    def __build_cnn(self, c, output_dim):
-        flatten_size = int(c ** 1.4 * 124 * 124)
+    def __build_cnn(self, c, h, w, output_dim):
+        conv1 = nn.Conv2d(in_channels=c, out_channels=c*2, kernel_size=8, stride=4)
+        conv2 = nn.Conv2d(in_channels=c*2, out_channels=c*4, kernel_size=4, stride=2)
+        conv3 = nn.Conv2d(in_channels=c*4, out_channels=c*4, kernel_size=3, stride=1)
+
+        # Calcular o tamanho da entrada para a camada linear
+        def conv2d_size_out(size, kernel_size=1, stride=1):
+            return (size - (kernel_size - 1) - 1) // stride + 1
+
+        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
+        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
+        linear_input_size = convw * convh * c * 4
+
+        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
+
         return nn.Sequential(
-            nn.Conv2d(in_channels=c, out_channels=c**2, kernel_size=8, stride=4),
+            conv1,
             nn.ReLU(),
-            nn.Conv2d(in_channels=c**2, out_channels=c**3, kernel_size=4, stride=2),
+            conv2,
             nn.ReLU(),
-            nn.Conv2d(in_channels=c**3, out_channels=c**3, kernel_size=3, stride=1),
+            conv3,
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(flatten_size, 512),
+            nn.Linear(linear_input_size, 512),
             nn.Hardtanh(),
+            nn.Linear(512, output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, 512),
+            nn.ReLU(),
             nn.Linear(512, output_dim),
         )
 
@@ -248,7 +265,7 @@ class MarioB:
         self.action_dim = action_dim
         self.save_dir = save_dir
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cpu"
 
         # Mario's DNN to predict the most optimal action - we implement this in the Learn section
         self.net = MarioNet(self.state_dim, self.action_dim).float()
@@ -281,7 +298,6 @@ class MarioB:
             state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
             state = torch.tensor(state, device=self.device).unsqueeze(0)
             action_values = self.net(state, model="online")
-            action_idx = torch.argmax(action_values, axis=1).item()
 
             # Aplicar penalidade de repetição apenas para ações de pular
             if 1 in self.action_history:
@@ -308,7 +324,7 @@ class Mario(MarioB):
         self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
         self.batch_size = 32
 
-        self.optimizer = opts.Lion(self.net.parameters(), lr=0.00025)
+        self.optimizer = opts.Adan(self.net.parameters(), lr=0.00025)
         self.loss_fn = torch.nn.SmoothL1Loss()
 
     def update_Q_online(self, td_estimate, td_target):
@@ -412,20 +428,16 @@ class Mario(MarioB):
 env = SkipFrame(env, skip=4)
 env = GrayScaleObservation(env)
 env = ResizeObservation(env, shape=1024)
-env = FrameStack(env, num_stack=4)
-
-use_cuda = torch.cuda.is_available()
-print(f"Using CUDA: {use_cuda}")
-print()
+env = FrameStack(env, num_stack=2)
 
 save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 
-mario = Mario(state_dim=(4, 1024, 1024), action_dim=env.action_space.n, save_dir=save_dir)
+mario = Mario(state_dim=(2, 1024, 1024), action_dim=env.action_space.n, save_dir=save_dir)
 
 logger = MetricLogger(save_dir)
 
-episodes = 40
+episodes = 100
 for e in range(episodes):
 
     state = env.reset()
@@ -456,7 +468,5 @@ for e in range(episodes):
             break
 
     logger.log_episode()
-
-    if (e % 20 == 0) or (e == episodes - 1):
-        logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
+    logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
