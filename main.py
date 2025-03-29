@@ -95,6 +95,16 @@ class ResizeObservation(gym.ObservationWrapper):
         observation = transforms(observation).squeeze(0)
         return observation
 
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(SelfAttentionLayer, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+
+    def forward(self, x):
+        x = x.unsqueeze(0)  # Adiciona uma dimensão para o batch
+        x, _ = self.attention(x, x, x)
+        x = x.squeeze(0)  # Remove a dimensão do batch
+        return x
 
 class MarioNet(nn.Module):
     """mini CNN structure
@@ -133,8 +143,6 @@ class MarioNet(nn.Module):
         convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
         linear_input_size = convw * convh * c * 4
 
-        self.attention = nn.MultiheadAttention(embed_dim=512, num_heads=8)
-
         return nn.Sequential(
             conv1,
             nn.ReLU(),
@@ -145,10 +153,7 @@ class MarioNet(nn.Module):
             nn.Flatten(),
             nn.Linear(linear_input_size, 512),
             nn.Hardtanh(),
-            nn.Linear(512, output_dim),
-            nn.ReLU(),
-            nn.Linear(output_dim, 512),
-            nn.ReLU(),
+            SelfAttentionLayer(embed_dim=512, num_heads=8),
             nn.Linear(512, output_dim),
         )
 
@@ -272,8 +277,8 @@ class MarioB:
         self.net = self.net.to(device=self.device)
 
         self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99999975
-        self.exploration_rate_min = 0.1
+        self.exploration_rate_decay = 0.98
+        self.exploration_rate_min = 0.15
         self.curr_step = 0
 
         self.save_every = 5e5  # no. of experiences between saving Mario Net
