@@ -278,17 +278,17 @@ class MarioB:
 
         self.save_every = 5e5  # no. of experiences between saving Mario Net
         self.action_history = deque(maxlen=10)  # Histórico das últimas ações
-        self.repetition_penalty = 0.9  # Penalidade para ações repetidas
+        self.repetition_penalty = 0.5  # Penalidade para ações repetidas
 
     def act(self, state):
         """
-    Given a state, choose an epsilon-greedy action and update value of step.
+        Given a state, choose an epsilon-greedy action and update value of step.
 
-    Inputs:
-    state(``LazyFrame``): A single observation of the current state, dimension is (state_dim)
-    Outputs:
-    ``action_idx`` (``int``): An integer representing which action Mario will perform
-    """
+        Inputs:
+        state(``LazyFrame``): A single observation of the current state, dimension is (state_dim)
+        Outputs:
+        ``action_idx`` (``int``): An integer representing which action Mario will perform
+        """
         # EXPLORE
         if np.random.rand() < self.exploration_rate:
             action_idx = np.random.randint(self.action_dim)
@@ -317,15 +317,18 @@ class MarioB:
 class Mario(MarioB):
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.gamma = 0.9
+        self.checkpoint_path = save_dir / "mario_net.chkpt"
+        self.gamma = 0.7
         self.burnin = 1e4  # min. experiences before training
-        self.learn_every = 3  # no. of experiences between updates to Q_online
-        self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
+        self.learn_every = 1  # no. of experiences between updates to Q_online
+        self.sync_every = 1e2  # no. of experiences between Q_target & Q_online sync
         self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
         self.batch_size = 32
 
         self.optimizer = opts.Adan(self.net.parameters(), lr=0.00025)
         self.loss_fn = torch.nn.SmoothL1Loss()
+        if self.checkpoint_path.exists():
+            self.load()
 
     def update_Q_online(self, td_estimate, td_target):
         loss = self.loss_fn(td_estimate, td_target)
@@ -415,25 +418,24 @@ class Mario(MarioB):
         return (td_est.mean().item(), loss)
 
     def save(self):
-        save_path = (
-                self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt"
-        )
-        torch.save(
-            dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
-            save_path,
-        )
-        print(f"MarioNet saved to {save_path} at step {self.curr_step}")
+        torch.save(dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate), self.checkpoint_path)
+        print(f"MarioNet salvo em {self.checkpoint_path} no passo {self.curr_step}")
 
+    def load(self):
+        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        self.net.load_state_dict(checkpoint["model"])
+        self.exploration_rate = checkpoint["exploration_rate"]
+        print(f"Checkpoint carregado de {self.checkpoint_path}")
 # Apply Wrappers to environment
-env = SkipFrame(env, skip=4)
+env = SkipFrame(env, skip=8)
 env = GrayScaleObservation(env)
-env = ResizeObservation(env, shape=1024)
-env = FrameStack(env, num_stack=2)
+env = ResizeObservation(env, shape=256)
+env = FrameStack(env, num_stack=4)
 
 save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 
-mario = Mario(state_dim=(2, 1024, 1024), action_dim=env.action_space.n, save_dir=save_dir)
+mario = Mario(state_dim=(4, 256, 256), action_dim=env.action_space.n, save_dir=save_dir)
 
 logger = MetricLogger(save_dir)
 
