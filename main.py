@@ -1,5 +1,7 @@
 import torch
 from torch import nn
+import torch_directml
+import math
 from torchvision import transforms as T
 import pytorch_optimizer as opts
 from PIL import Image
@@ -26,13 +28,15 @@ from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"  # Fixes AMD GPU issue with PyTorch
 
-# Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
-env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
+from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn, TimeElapsedColumn
 
+# Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
+env = gym_super_mario_bros.make("SuperMarioBrosRandomStages-v0", render_mode='human', apply_api_compatibility=True)
+print(gym.envs.registry.keys())
 # Limit the action-space to
 #   0. walk right
 #   1. jump right
-env = JoypadSpace(env, [["right"], ["A"], ["B"], ["left"]])
+env = JoypadSpace(env, [["right"], ["A"], ["A", "A"], ["B"], ["left"], ["A", "right"], ["B", "right"], ["right", "A", "B"]])
 
 env.reset()
 next_state, reward, done, trunc, info = env.step(action=0)
@@ -98,7 +102,7 @@ class ResizeObservation(gym.ObservationWrapper):
 class SelfAttentionLayer(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super(SelfAttentionLayer, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
 
     def forward(self, x):
         x = x.unsqueeze(0)  # Adiciona uma dimensão para o batch
@@ -151,10 +155,18 @@ class MarioNet(nn.Module):
             conv3,
             nn.ReLU(),
             nn.Flatten(),
-            SelfAttentionLayer(embed_dim=linear_input_size, num_heads=8),
-            nn.Hardswish(),
+            nn.ReLU(),
             nn.Linear(linear_input_size, 512),
-            nn.Hardtanh(),
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            SelfAttentionLayer(embed_dim=512, num_heads=8),
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            SelfAttentionLayer(embed_dim=512, num_heads=8),
+            nn.ReLU(),
+            nn.LayerNorm(512),
+            SelfAttentionLayer(embed_dim=512, num_heads=8),
+            nn.ReLU(),
             nn.Linear(512, output_dim),
         )
 
@@ -162,20 +174,11 @@ import numpy as np
 import time, datetime
 import matplotlib.pyplot as plt
 
+from rich.console import Console
 
 class MetricLogger:
-    def __init__(self, save_dir):
-        self.save_log = save_dir / "log"
-        with open(self.save_log, "w") as f:
-            f.write(
-                f"{'Episode':>8}{'Step':>8}{'Epsilon':>10}{'MeanReward':>15}"
-                f"{'MeanLength':>15}{'MeanLoss':>15}{'MeanQValue':>15}"
-                f"{'TimeDelta':>15}{'Time':>20}\n"
-            )
-        self.ep_rewards_plot = save_dir / "reward_plot.jpg"
-        self.ep_lengths_plot = save_dir / "length_plot.jpg"
-        self.ep_avg_losses_plot = save_dir / "loss_plot.jpg"
-        self.ep_avg_qs_plot = save_dir / "q_plot.jpg"
+    def __init__(self):
+        self.console = Console()
 
         # History metrics
         self.ep_rewards = []
@@ -239,31 +242,17 @@ class MetricLogger:
         self.record_time = time.time()
         time_since_last_record = np.round(self.record_time - last_record_time, 3)
 
-        print(
-            f"Episode {episode} - "
-            f"Step {step} - "
-            f"Epsilon {epsilon} - "
-            f"Mean Reward {mean_ep_reward} - "
-            f"Mean Length {mean_ep_length} - "
-            f"Mean Loss {mean_ep_loss} - "
-            f"Mean Q Value {mean_ep_q} - "
-            f"Time Delta {time_since_last_record} - "
-            f"Time {datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
+        self.console.print(
+            f":video_game: [bold green]Episode {episode}[/bold green] - "
+            f"[cyan]Step {step}[/cyan] - "
+            f":chart_with_upwards_trend: Epsilon [yellow]{epsilon:.3f}[/yellow] - "
+            f":trophy: Mean Reward [magenta]{mean_ep_reward}[/magenta] - "
+            f":stopwatch: Mean Length [blue]{mean_ep_length}[/blue] - "
+            f":bar_chart: Mean Loss [red]{mean_ep_loss}[/red] - "
+            f":brain: Mean Q Value [green]{mean_ep_q}[/green] - "
+            f":hourglass: Time Delta [cyan]{time_since_last_record}[/cyan] - "
+            f":calendar: Time [bold]{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}[/bold]"
         )
-
-        with open(self.save_log, "a") as f:
-            f.write(
-                f"{episode:8d}{step:8d}{epsilon:10.3f}"
-                f"{mean_ep_reward:15.3f}{mean_ep_length:15.3f}{mean_ep_loss:15.3f}{mean_ep_q:15.3f}"
-                f"{time_since_last_record:15.3f}"
-                f"{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'):>20}\n"
-            )
-
-        for metric in ["ep_lengths", "ep_avg_losses", "ep_avg_qs", "ep_rewards"]:
-            plt.clf()
-            plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
-            plt.legend()
-            plt.savefig(getattr(self, f"{metric}_plot"))
 
 class MarioB:
     def __init__(self, state_dim, action_dim, save_dir):
@@ -271,20 +260,19 @@ class MarioB:
         self.action_dim = action_dim
         self.save_dir = save_dir
 
-        self.device = "cpu"
-
+        self.device = torch_directml.device()
+        # self.device = 'cpu'
         # Mario's DNN to predict the most optimal action - we implement this in the Learn section
         self.net = MarioNet(self.state_dim, self.action_dim).float()
         self.net = self.net.to(device=self.device)
 
         self.exploration_rate = 1
-        self.exploration_rate_decay = 0.98
-        self.exploration_rate_min = 0.1
+        self.exploration_rate_decay = 0.99995
+        self.exploration_rate_min = 0
         self.curr_step = 0
 
         self.save_every = 5e5  # no. of experiences between saving Mario Net
-        self.action_history = deque(maxlen=10)  # Histórico das últimas ações
-        self.repetition_penalty = 0.5  # Penalidade para ações repetidas
+        self.last_position = None  # Adiciona um atributo para rastrear a última posição
 
     def act(self, state):
         """
@@ -304,10 +292,6 @@ class MarioB:
             state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
             state = torch.tensor(state, device=self.device).unsqueeze(0)
             action_values = self.net(state, model="online")
-
-            # Aplicar penalidade de repetição apenas para ações de pular
-            if 1 in self.action_history:
-                action_values[0, 1] *= self.repetition_penalty
             action_idx = torch.argmax(action_values, dim=1).item()
 
         # decrease exploration_rate
@@ -317,7 +301,6 @@ class MarioB:
         # increment step
         self.curr_step += 1
 
-        self.action_history.append(action_idx)
         return action_idx
 
 class Mario(MarioB):
@@ -328,11 +311,17 @@ class Mario(MarioB):
         self.burnin = 1e4  # min. experiences before training
         self.learn_every = 1  # no. of experiences between updates to Q_online
         self.sync_every = 1e2  # no. of experiences between Q_target & Q_online sync
-        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
+        from torchrl.data import ListStorage
+        self.memory = TensorDictReplayBuffer(storage=ListStorage(5000))
         self.batch_size = 32
 
-        self.optimizer = opts.Adan(self.net.parameters(), lr=0.00025)
-        self.loss_fn = torch.nn.SmoothL1Loss()
+        self.max_pos = 0
+        self.score_inicial = 0
+        self.coins_inicial = 0
+        self.vida_inicial = 2
+
+        self.optimizer = opts.Adan(self.net.parameters(), lr=0.0001)
+        self.loss_fn = torch.nn.SmoothL1Loss().to(torch_directml.device())
         if self.checkpoint_path.exists():
             self.load()
 
@@ -346,7 +335,68 @@ class Mario(MarioB):
     def sync_Q_target(self):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
-    def cache(self, state, next_state, action, reward, done):
+    def calculate_reward(self, reward, done, info):
+
+
+        # Recompensa baseada no progresso
+        if self.last_position is not None:
+            if (info["x_pos"] - self.max_pos) > 5:
+                self.max_pos = max(self.max_pos, info["x_pos"])
+                progress_reward = info["x_pos"]
+            else:
+                progress_reward = -0.2
+
+        else:
+            progress_reward = 0
+            self.last_position = info["x_pos"]
+
+        # Penalidade por morte
+        if done and not info.get("flag_get", False):
+            reward -= 10
+
+        # Recompensa por completar o nível
+        if info.get("flag_get", False):
+            reward += 100
+        
+        # Recompensa por pegar vidas extras
+        if info.get("life", 0) > 2:
+            reward += 50
+
+        if 'life' in info:
+            if info["life"] > self.vida_inicial:
+                reward += 1000
+                self.vida_inicial = info["life"]
+
+            if info["life"] < self.vida_inicial:
+                reward -= 70
+
+        # Recompensa por coletar moedas
+        if "coins" in info:
+            if info["coins"] > self.coins_inicial:
+                reward += info["coins"]
+                self.coins_inicial = info["coins"]
+
+            if self.coins_inicial == 0:
+                reward -= 0.5
+
+        # Recompensa por eliminar inimigos
+        if "score" in info:
+            if info["score"] > self.score_inicial:
+                reward += info["score"] - self.score_inicial
+                self.score_inicial = info["score"]
+
+            if self.score_inicial == 0:
+                reward -= 0.5
+
+        # Penalidade por tempo gasto
+        reward -= 1
+
+        # Soma a recompensa de progresso
+        reward += progress_reward
+
+        return reward
+
+    def cache(self, state, next_state, action, reward, done, info):
         """
         Store the experience to self.memory (replay buffer)
 
@@ -369,9 +419,18 @@ class Mario(MarioB):
         action = torch.tensor([action])
         reward = torch.tensor([reward])
         done = torch.tensor([done])
-
+        reward = self.calculate_reward(reward, done, info)
         # self.memory.append((state, next_state, action, reward, done,))
-        self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
+        self.memory.add(TensorDict({
+            "state": state,
+            "next_state": next_state,
+            "action": action,
+            "reward": torch.tensor([reward]),
+            "done": torch.tensor([done])
+        }, batch_size=[]))
+
+        # Atualiza a última posição conhecida
+        self.last_position = info['x_pos']
 
     def recall(self):
         """
@@ -432,49 +491,69 @@ class Mario(MarioB):
         self.net.load_state_dict(checkpoint["model"])
         self.exploration_rate = checkpoint["exploration_rate"]
         print(f"Checkpoint carregado de {self.checkpoint_path}")
+
 # Apply Wrappers to environment
-env = SkipFrame(env, skip=8)
+env = SkipFrame(env, skip=4)
 env = GrayScaleObservation(env)
-env = ResizeObservation(env, shape=256)
-env = FrameStack(env, num_stack=4)
+env = ResizeObservation(env, shape=128)
+env = FrameStack(env, num_stack=8)
 
-save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-save_dir.mkdir(parents=True)
+save_dir = Path("checkpoints")
+save_dir.mkdir(parents=True, exist_ok=True)
 
-mario = Mario(state_dim=(4, 256, 256), action_dim=env.action_space.n, save_dir=save_dir)
+mario = Mario(state_dim=(8, 128, 128), action_dim=env.action_space.n, save_dir=save_dir)
 
-logger = MetricLogger(save_dir)
+logger = MetricLogger()
 
-episodes = 100
-for e in range(episodes):
+episodes = 300
 
-    state = env.reset()
+# Initialize rich progress bar
+progress = Progress(
+    TextColumn("[bold blue]{task.description}"),
+    BarColumn(),
+    "[progress.percentage]{task.percentage:>3.0f}%",
+    TimeElapsedColumn(),
+    TimeRemainingColumn(),
+)
+training_task = progress.add_task("Training Mario Agent", total=episodes)
 
-    # Play the game!
-    while True:
+with progress:
+    for e in range(episodes):
+        state = env.reset()
+        mario.last_position = None  # Reseta a última posição no início de cada episódio
+        mario.score_inicial = 0
+        mario.coins_inicial = 0
+        mario.vida_inicial = 2
+        mario.max_pos = 0
+        # Play the game!
+        while True:
+            # Run agent on the state
+            action = mario.act(state)
 
-        # Run agent on the state
-        action = mario.act(state)
+            # Agent performs action
+            next_state, reward, done, trunc, info = env.step(action)
 
-        # Agent performs action
-        next_state, reward, done, trunc, info = env.step(action)
+            # Remember
+            mario.cache(state, next_state, action, reward, done, info)
 
-        # Remember
-        mario.cache(state, next_state, action, reward, done)
+            # Learn
+            q, loss = mario.learn()
 
-        # Learn
-        q, loss = mario.learn()
+            # Logging
+            logger.log_step(reward, loss, q)
 
-        # Logging
-        logger.log_step(reward, loss, q)
+            # Update state
+            state = next_state
 
-        # Update state
-        state = next_state
+            # Check if end of game
+            if done or info["flag_get"]:
+                break
 
-        # Check if end of game
-        if done or info["flag_get"]:
-            break
+        # Update progress bar
+        progress.update(training_task, advance=1)
+        logger.log_episode()
+        logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
-    logger.log_episode()
-    logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
+    mario.save()
+        
 
