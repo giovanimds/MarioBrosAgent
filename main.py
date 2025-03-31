@@ -31,12 +31,15 @@ os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"  # Fixes AMD GPU issue with Py
 from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn, TimeElapsedColumn
 
 # Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
-env = gym_super_mario_bros.make("SuperMarioBrosRandomStages-v0", render_mode='human', apply_api_compatibility=True)
+env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='human', apply_api_compatibility=True)
 print(gym.envs.registry.keys())
-# Limit the action-space to
-#   0. walk right
-#   1. jump right
-env = JoypadSpace(env, [["right"], ["A"], ["A", "A"], ["B"], ["left"], ["A", "right"], ["B", "right"], ["right", "A", "B"]])
+
+env = JoypadSpace(env, [
+    ["right"], ['up'], ['down'], ["left"], 
+    ["A"], ["B"], [],
+    ['A', 'A', 'A', 'right'], # Pra subir no tubo
+    ['B', 'right'] # Pra correr
+])
 
 env.reset()
 next_state, reward, done, trunc, info = env.step(action=0)
@@ -99,32 +102,84 @@ class ResizeObservation(gym.ObservationWrapper):
         observation = transforms(observation).squeeze(0)
         return observation
 
+import matplotlib.pyplot as plt
+plt.ion()  # Ativa modo interativo
+
 class SelfAttentionLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads):
-        super(SelfAttentionLayer, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+    def __init__(self, embed_dim, num_heads, output_dim, num_layers=1):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.attn_weights = None  # Para armazenar os pesos de atenção
+        self.input_logits = None  # Para armazenar os logits de entrada
+
+        self.lstm_layers = nn.ModuleList()
+        self.attention_layers = nn.ModuleList()
+
+        for i in range(num_layers):
+            
+            self.attention_layers.append(
+                nn.MultiheadAttention(
+                    embed_dim=embed_dim, 
+                    num_heads=num_heads, 
+                    batch_first=True
+                )
+            )
+            self.lstm_layers.append(
+                nn.LSTM(embed_dim, embed_dim, batch_first=True)
+            )
+
+        self.conv1x1 = nn.Conv2d(4, 1, kernel_size=1)  # Preserva 2D
+        self.out_project = nn.Linear(embed_dim, output_dim)  # Projeção linear
+        
 
     def forward(self, x):
-        x = x.unsqueeze(0)  # Adiciona uma dimensão para o batch
-        x, _ = self.attention(x, x, x)
-        x = x.squeeze(0)  # Remove a dimensão do batch
-        return x
+        batch, channels, height, width = x.shape
+        original = x.view(batch, channels, -1)  # [batch, channels, height*width]
+        self.input_logits = original.detach().cpu()
+        # Corrigindo a forma de entrada
+        if x.dim() == 2:  # [batch, features]
+            x = x.unsqueeze(1)  # [batch, seq_len=1, features]
+        if x.dim() == 4:
+            x = x.view(x.size(0), x.size(1), -1)
+
+        for attn, lstm in zip(self.attention_layers, self.lstm_layers):
+            x, attn_weights = attn(x, x, x)
+            x, _ = lstm(x)
+
+        self.attn_weights = x.detach().cpu()
+        out = self.conv1x1(x.view(batch, channels, height, width)).view(batch, -1)
+        out = self.out_project(out)
+        return out # Retorna para [batch, features]
+
+
+
+
 
 class MarioNet(nn.Module):
-    """mini CNN structure
-  input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
-  """
-
+    """CNN com Self-Attention aprimorada"""
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
+        # self.device = torch_directml.device()
+        self.device = 'cpu'
+        # Self-Attention
+        self.attention = SelfAttentionLayer(
+            embed_dim=h*w,  # Deve corresponder ao número de canais
+            num_heads=c,
+            output_dim=output_dim,
+            num_layers=2,
+        )
 
-        self.online = self.__build_cnn(c, h, w, output_dim)
-
-        self.target = self.__build_cnn(c, h, w, output_dim)
+        # Inicialização dos modelos
+        self.online = self.attention
+        self.target = self.attention
         self.target.load_state_dict(self.online.state_dict())
-
-        # Q_target parameters are frozen.
+        
+        # Congelar parâmetros do target
         for p in self.target.parameters():
             p.requires_grad = False
 
@@ -134,42 +189,16 @@ class MarioNet(nn.Module):
         elif model == "target":
             return self.target(input)
 
-    def __build_cnn(self, c, h, w, output_dim):
-        conv1 = nn.Conv2d(in_channels=c, out_channels=c*2, kernel_size=8, stride=4)
-        conv2 = nn.Conv2d(in_channels=c*2, out_channels=c*4, kernel_size=4, stride=2)
-        conv3 = nn.Conv2d(in_channels=c*4, out_channels=c*4, kernel_size=3, stride=1)
-
-        # Calcular o tamanho da entrada para a camada linear
-        def conv2d_size_out(size, kernel_size=1, stride=1):
-            return (size - (kernel_size - 1) - 1) // stride + 1
-
-        convw = conv2d_size_out(conv2d_size_out(conv2d_size_out(w, 8, 4), 4, 2), 3, 1)
-        convh = conv2d_size_out(conv2d_size_out(conv2d_size_out(h, 8, 4), 4, 2), 3, 1)
-        linear_input_size = convw * convh * c * 4
-
-        return nn.Sequential(
-            conv1,
-            nn.ReLU(),
-            conv2,
-            nn.ReLU(),
-            conv3,
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.ReLU(),
-            nn.Linear(linear_input_size, 512),
-            nn.ReLU(),
-            nn.LayerNorm(512),
-            SelfAttentionLayer(embed_dim=512, num_heads=8),
-            nn.ReLU(),
-            nn.LayerNorm(512),
-            SelfAttentionLayer(embed_dim=512, num_heads=8),
-            nn.ReLU(),
-            nn.LayerNorm(512),
-            SelfAttentionLayer(embed_dim=512, num_heads=8),
-            nn.ReLU(),
-            nn.Linear(512, output_dim),
-        )
-
+    def get_attention_heatmap(self):
+        """Retorna o heatmap de atenção para visualização"""
+        if self.attention.attn_weights is None:
+            return None
+            
+        # Processar os pesos de atenção
+        attn = self.attention.attn_weights.mean(dim=-1)[0]  # Média entre heads
+        size = int(np.sqrt(attn.shape[-1]))  # Assume formato quadrado
+        return attn.view(size, size) if size*size == attn.shape[-1] else None
+    
 import numpy as np
 import time, datetime
 import matplotlib.pyplot as plt
@@ -260,15 +289,15 @@ class MarioB:
         self.action_dim = action_dim
         self.save_dir = save_dir
 
-        self.device = torch_directml.device()
-        # self.device = 'cpu'
+        # self.device = torch_directml.device()
+        self.device = 'cpu'
         # Mario's DNN to predict the most optimal action - we implement this in the Learn section
         self.net = MarioNet(self.state_dim, self.action_dim).float()
         self.net = self.net.to(device=self.device)
 
-        self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99995
-        self.exploration_rate_min = 0
+        self.exploration_rate = 0.5
+        self.exploration_rate_decay = 0.99999
+        self.exploration_rate_min = 0.05
         self.curr_step = 0
 
         self.save_every = 5e5  # no. of experiences between saving Mario Net
@@ -308,22 +337,43 @@ class Mario(MarioB):
         super().__init__(state_dim, action_dim, save_dir)
         self.checkpoint_path = save_dir / "mario_net.chkpt"
         self.gamma = 0.7
-        self.burnin = 1e4  # min. experiences before training
-        self.learn_every = 1  # no. of experiences between updates to Q_online
-        self.sync_every = 1e2  # no. of experiences between Q_target & Q_online sync
+        self.console = Console()
+        self.burnin = 1e2  # min. experiences before training
+        self.learn_every = 6  # no. of experiences between updates to Q_online
+        self.sync_every = 24  # no. of experiences between Q_target & Q_online sync
         from torchrl.data import ListStorage
-        self.memory = TensorDictReplayBuffer(storage=ListStorage(5000))
+        self.memory = TensorDictReplayBuffer(storage=ListStorage(10000))
         self.batch_size = 32
-
+        self.plot_every = 1000
+        self.fig, self.ax = plt.subplots()
+        self.heatmap = None
         self.max_pos = 0
         self.score_inicial = 0
         self.coins_inicial = 0
         self.vida_inicial = 2
 
-        self.optimizer = opts.Adan(self.net.parameters(), lr=0.0001)
-        self.loss_fn = torch.nn.SmoothL1Loss().to(torch_directml.device())
+        self.optimizer = opts.Adan(self.net.parameters(), lr=0.001, weight_decay=0.01)
+        self.loss_fn = torch.nn.MSELoss()
         if self.checkpoint_path.exists():
             self.load()
+
+    def _update_plot(self):
+        """Atualiza o mapa de calor em tempo real"""
+        heatmap_data = self.net.get_attention_heatmap()
+        
+        if heatmap_data is not None:
+            if self.heatmap is None:
+                self.heatmap = self.ax.imshow(
+                    heatmap_data, 
+                    cmap='viridis', 
+                    interpolation='nearest'
+                )
+                plt.colorbar(self.heatmap, ax=self.ax)
+            else:
+                self.heatmap.set_data(heatmap_data)
+                self.heatmap.autoscale()
+            
+            plt.pause(0.001)
 
     def update_Q_online(self, td_estimate, td_target):
         loss = self.loss_fn(td_estimate, td_target)
@@ -337,30 +387,25 @@ class Mario(MarioB):
 
     def calculate_reward(self, reward, done, info):
 
-
+        progress_reward = 0
         # Recompensa baseada no progresso
         if self.last_position is not None:
-            if (info["x_pos"] - self.max_pos) > 5:
+            if (info["x_pos"] - self.max_pos) > 0:
                 self.max_pos = max(self.max_pos, info["x_pos"])
-                progress_reward = info["x_pos"]
+                progress_reward = (self.max_pos - self.last_position)/10
+                self.last_position = info["x_pos"]
             else:
                 progress_reward = -0.2
 
         else:
             progress_reward = 0
             self.last_position = info["x_pos"]
-
-        # Penalidade por morte
-        if done and not info.get("flag_get", False):
-            reward -= 10
+            self.max_pos = info["x_pos"]
 
         # Recompensa por completar o nível
         if info.get("flag_get", False):
             reward += 100
-        
-        # Recompensa por pegar vidas extras
-        if info.get("life", 0) > 2:
-            reward += 50
+    
 
         if 'life' in info:
             if info["life"] > self.vida_inicial:
@@ -368,28 +413,23 @@ class Mario(MarioB):
                 self.vida_inicial = info["life"]
 
             if info["life"] < self.vida_inicial:
-                reward -= 70
+                reward -= 50
+                self.vida_inicial = info["life"]
 
         # Recompensa por coletar moedas
-        if "coins" in info:
-            if info["coins"] > self.coins_inicial:
-                reward += info["coins"]
-                self.coins_inicial = info["coins"]
 
-            if self.coins_inicial == 0:
-                reward -= 0.5
+        if info["coins"] > self.coins_inicial:
+            reward += info["coins"]
+            self.coins_inicial = info["coins"]
 
         # Recompensa por eliminar inimigos
-        if "score" in info:
-            if info["score"] > self.score_inicial:
-                reward += info["score"] - self.score_inicial
-                self.score_inicial = info["score"]
 
-            if self.score_inicial == 0:
-                reward -= 0.5
+        if info["score"] > self.score_inicial:
+            reward += float(info["score"] - self.score_inicial)
+            self.score_inicial = float(info["score"])
 
         # Penalidade por tempo gasto
-        reward -= 1
+        reward -= 0.1
 
         # Soma a recompensa de progresso
         reward += progress_reward
@@ -441,6 +481,7 @@ class Mario(MarioB):
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
     def td_estimate(self, state, action):
+        state = state.requires_grad_()  # Ensure state requires gradients
         current_Q = self.net(state, model="online")[
             np.arange(0, self.batch_size), action
         ]  # Q_online(s,a)
@@ -449,7 +490,7 @@ class Mario(MarioB):
     @torch.no_grad()
     def td_target(self, reward, next_state, done):
         next_state_Q = self.net(next_state, model="online")
-        best_action = torch.argmax(next_state_Q, dim=1)
+        best_action = torch.argmax(next_state_Q, dim=-1)
         next_Q = self.net(next_state, model="target")[
             np.arange(0, self.batch_size), best_action
         ]
@@ -482,30 +523,40 @@ class Mario(MarioB):
 
         return (td_est.mean().item(), loss)
 
+    def act(self, state):
+        action = super().act(state)
+        
+        # Atualizar visualização periodicamente
+        if self.curr_step % self.plot_every == 0:
+            pass
+            # self._update_plot()
+            
+        return action
+
     def save(self):
         torch.save(dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate), self.checkpoint_path)
         print(f"MarioNet salvo em {self.checkpoint_path} no passo {self.curr_step}")
 
     def load(self):
-        checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(self.checkpoint_path)
         self.net.load_state_dict(checkpoint["model"])
         self.exploration_rate = checkpoint["exploration_rate"]
         print(f"Checkpoint carregado de {self.checkpoint_path}")
 
 # Apply Wrappers to environment
-env = SkipFrame(env, skip=4)
+env = SkipFrame(env, skip=2)
 env = GrayScaleObservation(env)
-env = ResizeObservation(env, shape=128)
-env = FrameStack(env, num_stack=8)
+env = ResizeObservation(env, shape=64)
+env = FrameStack(env, num_stack=4)
 
 save_dir = Path("checkpoints")
 save_dir.mkdir(parents=True, exist_ok=True)
 
-mario = Mario(state_dim=(8, 128, 128), action_dim=env.action_space.n, save_dir=save_dir)
+mario = Mario(state_dim=(4, 64, 64), action_dim=env.action_space.n, save_dir=save_dir)
 
 logger = MetricLogger()
 
-episodes = 300
+episodes = 100
 
 # Initialize rich progress bar
 progress = Progress(
@@ -539,6 +590,8 @@ with progress:
             # Learn
             q, loss = mario.learn()
 
+            progress.update(training_task, description='Reward on turn: ' + str(reward))
+
             # Logging
             logger.log_step(reward, loss, q)
 
@@ -555,5 +608,5 @@ with progress:
         logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
     mario.save()
-        
+plt.close()  # Fechar a figura ao final do treinamento
 
