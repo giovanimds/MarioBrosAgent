@@ -1,0 +1,40 @@
+[project]
+name = "mario-bros-agent"
+version = "0.1.0"
+description = "Agente de IA para jogar Super Mario Bros usando Deep Reinforcement Learning"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "torch-directml",
+    "torchvision",
+    "pytorch-optimizer",
+    "pillow",
+    "numpy",
+    "gym",
+    "nes-py",
+    "gym-super-mario-bros",
+    "matplotlib",
+    "tqdm",
+    "opencv-python"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+    "mypy"
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.900"
+]
