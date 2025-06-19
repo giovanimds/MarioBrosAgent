@@ -265,6 +265,9 @@ class MarioNet(nn.Module):
         if self.last_gate_probs is not None:
             # Calcular distribuição de uso dos especialistas
             expert_usage = self.last_gate_probs.mean(dim=0).cpu().numpy()
+            # Skip metrics if usage contains NaN
+            if np.isnan(expert_usage).any():
+                return None
             
             return {
                 'load_balancing_loss': self.last_load_balancing_loss,

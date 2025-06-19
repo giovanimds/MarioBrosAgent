@@ -16,7 +16,10 @@ dependencies = [
     "gym-super-mario-bros",
     "matplotlib",
     "tqdm",
-    "opencv-python"
+    "opencv-python",
+    "torchrl",
+    "tensordict",
+    "rich"
 ]
 
 [project.optional-dependencies]
