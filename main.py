@@ -28,8 +28,6 @@ from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 import os
 os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"  # Fixes AMD GPU issue with PyTorch
 
-from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn, TimeElapsedColumn
-
 # Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
 # env = gym_super_mario_bros.make("SuperMarioBrosRandomStages-v0", render_mode='human', apply_api_compatibility=True)
 env = gym_super_mario_bros.make("SuperMarioBros-v3", render_mode=None, apply_api_compatibility=True)
@@ -288,6 +286,8 @@ import time, datetime
 import matplotlib.pyplot as plt
 
 from rich.console import Console
+from rich.table import Table
+from rich.live import Live
 
 class MetricLogger:
     def __init__(self):
@@ -310,6 +310,10 @@ class MetricLogger:
 
         # Timing
         self.record_time = time.time()
+        
+        # Rich Live Display
+        self.live = None
+        self.current_episode = 0
 
     def log_step(self, reward, loss, q, moe_metrics=None):
         self.curr_ep_reward += reward
@@ -341,7 +345,104 @@ class MetricLogger:
         self.curr_ep_q = 0.0
         self.curr_ep_loss_length = 0
 
-    def record(self, episode, epsilon, step):
+    def start_live_display(self):
+        """Inicia o display live da tabela"""
+        self.live = Live(self.generate_table(), refresh_per_second=4, screen=True)
+        self.live.start()
+
+    def stop_live_display(self):
+        """Para o display live da tabela"""
+        if self.live:
+            self.live.stop()
+
+    def generate_table(self, moe_metrics=None, mario_net=None):
+        """Gera a tabela principal de monitoramento com informações dos experts"""
+        table = Table(title="🎮 Mario Bros Agent Training Monitor", show_header=True, header_style="bold magenta")
+        
+        # Colunas principais
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Current", style="green")
+        table.add_column("Mean (Last 100)", style="yellow")
+        table.add_column("Best", style="bold green")
+        
+        # Calcular métricas
+        current_reward = self.curr_ep_reward
+        current_length = self.curr_ep_length
+        
+        mean_reward = np.mean(self.ep_rewards[-100:]) if self.ep_rewards else 0
+        mean_length = np.mean(self.ep_lengths[-100:]) if self.ep_lengths else 0
+        mean_loss = np.mean(self.ep_avg_losses[-100:]) if self.ep_avg_losses else 0
+        mean_q = np.mean(self.ep_avg_qs[-100:]) if self.ep_avg_qs else 0
+        
+        best_reward = max(self.ep_rewards) if self.ep_rewards else 0
+        best_length = max(self.ep_lengths) if self.ep_lengths else 0
+        
+        # Adicionar linhas
+        table.add_row("🏆 Episode", str(self.current_episode), "-", "-")
+        table.add_row("💰 Reward", f"{current_reward:.2f}", f"{mean_reward:.2f}", f"{best_reward:.2f}")
+        table.add_row("⏱️ Length", str(current_length), f"{mean_length:.1f}", str(best_length))
+        table.add_row("📉 Loss", "-", f"{mean_loss:.5f}", "-")
+        table.add_row("🧠 Q-Value", "-", f"{mean_q:.3f}", "-")
+        
+        # Adicionar informações adicionais
+        table.add_section()
+        table.add_row("🎯 Epsilon", f"{getattr(self, 'current_epsilon', 0):.4f}", "-", "-")
+        table.add_row("📊 Total Steps", f"{getattr(self, 'current_step', 0)}", "-", "-")
+        
+        # Adicionar seção MoE
+        table.add_section()
+        
+        # Obter informações dos experts
+        if moe_metrics and 'expert_usage' in moe_metrics:
+            expert_usage = moe_metrics.get('expert_usage', [])
+            
+            # Obter estatísticas detalhadas se disponível
+            if mario_net and hasattr(mario_net, 'moe_layer'):
+                detailed_stats = mario_net.moe_layer.get_expert_usage_stats()
+                expert_usage = detailed_stats.get('usage', expert_usage)
+            
+            if len(expert_usage) > 0:
+                # Criar string com percentuais separados por barras
+                expert_percentages = " | ".join([f"{usage*100:.0f}%" for usage in expert_usage])
+                table.add_row("🤖 Expert Usage", expert_percentages, "-", "-")
+                
+                # Adicionar métricas de balanceamento
+                table.add_row("⚖️ Load Balance", f"{moe_metrics.get('load_balancing_loss', 0):.4f}", "-", "-")
+                table.add_row("🎯 Expert Entropy", f"{moe_metrics.get('expert_entropy', 0):.3f}", "-", "Higher is better")
+                
+                # Status de balanceamento
+                max_usage = max(expert_usage) if len(expert_usage) > 0 else 0
+                if max_usage > 0.5:
+                    balance_status = "[bold red]⚠️ SEVERE IMBALANCE[/bold red]"
+                elif max_usage > 0.4:
+                    balance_status = "[red]🔥 High imbalance[/red]"
+                elif max_usage > 0.3:
+                    balance_status = "[yellow]⚠️ Moderate imbalance[/yellow]"
+                else:
+                    balance_status = "[green]✅ Well balanced[/green]"
+                
+                table.add_row("📊 Balance Status", balance_status, "-", "-")
+            else:
+                table.add_row("🤖 Expert Usage", "⏳ Loading...", "-", "-")
+        else:
+            table.add_row("🤖 Expert Usage", "❌ No data", "-", "-")
+        
+        return table
+
+    # Método generate_expert_table removido - informações dos experts agora estão na tabela principal
+
+    def update_live_display(self, episode, moe_metrics=None, mario_net=None, epsilon=None, step=None):
+        """Atualiza o display live com as informações atuais"""
+        self.current_episode = episode
+        self.current_epsilon = epsilon if epsilon is not None else getattr(self, 'current_epsilon', 0)
+        self.current_step = step if step is not None else getattr(self, 'current_step', 0)
+        
+        if self.live:
+            # Usar apenas uma tabela com todas as informações
+            main_table = self.generate_table(moe_metrics, mario_net)
+            self.live.update(main_table)
+
+    def record(self, episode, epsilon, step, moe_metrics=None, mario_net=None):
         mean_ep_reward = np.round(np.mean(self.ep_rewards[-100:]), 3)
         mean_ep_length = np.round(np.mean(self.ep_lengths[-100:]), 3)
         mean_ep_loss = np.round(np.mean(self.ep_avg_losses[-100:]), 3)
@@ -355,17 +456,22 @@ class MetricLogger:
         self.record_time = time.time()
         time_since_last_record = np.round(self.record_time - last_record_time, 3)
 
-        self.console.print(
-            f":video_game: [bold green]Episode {episode}[/bold green] - "
-            f"[cyan]Step {step}[/cyan] - "
-            f":chart_with_upwards_trend: Epsilon [yellow]{epsilon:.3f}[/yellow] - "
-            f":trophy: Mean Reward [magenta]{mean_ep_reward}[/magenta] - "
-            f":stopwatch: Mean Length [blue]{mean_ep_length}[/blue] - "
-            f":bar_chart: Mean Loss [red]{mean_ep_loss}[/red] - "
-            f":brain: Mean Q Value [green]{mean_ep_q}[/green] - "
-            f":hourglass: Time Delta [cyan]{time_since_last_record}[/cyan] - "
-            f":calendar: Time [bold]{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}[/bold]"
-        )
+        # Atualizar display live se estiver ativo
+        if self.live:
+            self.update_live_display(episode, moe_metrics, mario_net)
+        else:
+            # Fallback para console normal
+            self.console.print(
+                f":video_game: [bold green]Episode {episode}[/bold green] - "
+                f"[cyan]Step {step}[/cyan] - "
+                f":chart_with_upwards_trend: Epsilon [yellow]{epsilon:.3f}[/yellow] - "
+                f":trophy: Mean Reward [magenta]{mean_ep_reward}[/magenta] - "
+                f":stopwatch: Mean Length [blue]{mean_ep_length}[/blue] - "
+                f":bar_chart: Mean Loss [red]{mean_ep_loss}[/red] - "
+                f":brain: Mean Q Value [green]{mean_ep_q}[/green] - "
+                f":hourglass: Time Delta [cyan]{time_since_last_record}[/cyan] - "
+                f":calendar: Time [bold]{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}[/bold]"
+            )
 
 class MarioB:
     def __init__(self, state_dim, action_dim, save_dir):
@@ -435,8 +541,19 @@ class Mario(MarioB):
         self.coins_inicial = 0
         self.vida_inicial = 2
 
-        self.optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01, momentum=0.9, weight_decay=0.01)
+        # Usar Adam padrão do PyTorch ao invés de RAdam para evitar problemas de estado
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.001, weight_decay=0.01)
         self.loss_fn = torch.nn.MSELoss()
+        
+        # Adicionando scheduler dinâmico para load balancing
+        self.load_balancing_scheduler = {
+            'base_coef': 0.1,
+            'max_coef': 0.5,
+            'imbalance_threshold': 0.4,
+            'adjustment_factor': 1.1,
+            'decay_factor': 0.99
+        }
+        
         if self.checkpoint_path.exists():
             self.load()
 
@@ -445,18 +562,8 @@ class Mario(MarioB):
         heatmap_data = self.net.get_attention_heatmap()
         
         if heatmap_data is not None:
-            if self.heatmap is None:
-                self.heatmap = self.ax.imshow(
-                    heatmap_data, 
-                    cmap='viridis', 
-                    interpolation='nearest'
-                )
-                plt.colorbar(self.heatmap, ax=self.ax)
-            else:
-                self.heatmap.set_data(heatmap_data)
-                self.heatmap.autoscale()
-            
-            plt.pause(0.001)
+            # Implementação removida - usando Rich table em vez de matplotlib
+            pass
 
     def update_Q_online(self, td_estimate, td_target):
         # Loss principal (Q-learning)
@@ -596,6 +703,10 @@ class Mario(MarioB):
         if self.curr_step % self.learn_every != 0:
             return None, None
 
+        # Ajustar coeficiente de load balancing dinamicamente a cada 100 steps
+        if self.curr_step % 100 == 0:
+            self.adjust_load_balancing_coefficient()
+
         # Sample from memory
         state, next_state, action, reward, done = self.recall()
 
@@ -625,7 +736,7 @@ class Mario(MarioB):
         print(f"MarioNet salvo em {self.checkpoint_path} no passo {self.curr_step}")
 
     def load(self):
-        checkpoint = torch.load(self.checkpoint_path)
+        checkpoint = torch.load(self.checkpoint_path, weights_only=False)
         self.net.load_state_dict(checkpoint["model"])
         self.exploration_rate = checkpoint["exploration_rate"]
         print(f"Checkpoint carregado de {self.checkpoint_path}")
@@ -639,35 +750,120 @@ class Mario(MarioB):
             self.console.print(f"[yellow]Load Balancing Loss:[/yellow] {moe_metrics['load_balancing_loss']:.6f}")
             self.console.print(f"[yellow]Expert Entropy:[/yellow] {moe_metrics['expert_entropy']:.4f}")
             
+            # Obter estatísticas mais detalhadas do MoE
+            moe_layer = self.net.moe_layer
+            detailed_stats = moe_layer.get_expert_usage_stats()
+            
+            self.console.print(f"[yellow]Max Expert Usage:[/yellow] {detailed_stats['max_usage']:.3f}")
+            self.console.print(f"[yellow]Min Expert Usage:[/yellow] {detailed_stats['min_usage']:.3f}")
+            self.console.print(f"[yellow]Std Expert Usage:[/yellow] {detailed_stats['std_usage']:.3f}")
+            self.console.print(f"[yellow]Coefficient of Variation:[/yellow] {detailed_stats['coefficient_of_variation']:.3f}")
+            
+            # Aviso se há desbalanceamento severo
+            if detailed_stats['max_usage'] > 0.5:
+                self.console.print("[bold red]⚠️  SEVERE IMBALANCE DETECTED![/bold red]")
+                self.console.print(f"[red]One expert is dominating with {detailed_stats['max_usage']:.1%} usage[/red]")
+            elif detailed_stats['max_usage'] > 0.3:
+                self.console.print("[yellow]⚠️  Moderate imbalance detected[/yellow]")
+            
             # Mostrar uso de cada especialista
-            expert_usage = moe_metrics['expert_usage']
+            expert_usage = detailed_stats['usage']
             self.console.print("[yellow]Expert Usage Distribution:[/yellow]")
             for i, usage in enumerate(expert_usage):
                 bar_length = int(usage * 50)  # Barra de 50 caracteres
                 bar = "█" * bar_length + "░" * (50 - bar_length)
-                self.console.print(f"  Expert {i+1}: [{bar}] {usage:.3f}")
+                
+                # Colorir baseado no uso
+                if usage > 0.4:
+                    color = "[red]"
+                elif usage > 0.25:
+                    color = "[yellow]"
+                elif usage < 0.05:
+                    color = "[dim]"
+                else:
+                    color = "[green]"
+                
+                self.console.print(f"  Expert {i+1}: {color}[{bar}] {usage:.3f}[/{color.strip('[]')}]")
             
             # Mostrar especialistas mais e menos usados
-            most_used = np.argmax(expert_usage)
-            least_used = np.argmin(expert_usage)
+            most_used = int(np.argmax(expert_usage))
+            least_used = int(np.argmin(expert_usage))
             self.console.print(f"[green]Most used expert:[/green] Expert {most_used+1} ({expert_usage[most_used]:.3f})")
             self.console.print(f"[red]Least used expert:[/red] Expert {least_used+1} ({expert_usage[least_used]:.3f})")
+            
+            # Sugestões para balanceamento
+            if detailed_stats['coefficient_of_variation'] > 1.0:
+                self.console.print("\n[bold yellow]💡 Balancing Suggestions:[/bold yellow]")
+                self.console.print("- Consider increasing load_balancing_loss_coef")
+                self.console.print("- Add more noise to gating network")
+                self.console.print("- Reduce learning rate temporarily")
+            
             print()
 
-    # ...existing code...
+    def adjust_load_balancing_coefficient(self):
+        """Ajusta dinamicamente o coeficiente de load balancing baseado no desbalanceamento"""
+        moe_layer = self.net.moe_layer
+        stats = moe_layer.get_expert_usage_stats()
+        
+        max_usage = stats['max_usage']
+        current_coef = moe_layer.load_balancing_loss_coef
+        
+        # Se há desbalanceamento severo, aumenta o coeficiente
+        if max_usage > self.load_balancing_scheduler['imbalance_threshold']:
+            new_coef = min(
+                current_coef * self.load_balancing_scheduler['adjustment_factor'],
+                self.load_balancing_scheduler['max_coef']
+            )
+            moe_layer.load_balancing_loss_coef = new_coef
+            self.console.print(f"[yellow]🔧 Increased load balancing coef to {new_coef:.4f}[/yellow]")
+        
+        # Se está bem balanceado, diminui gradualmente o coeficiente
+        elif max_usage < 0.25 and current_coef > self.load_balancing_scheduler['base_coef']:
+            new_coef = max(
+                current_coef * self.load_balancing_scheduler['decay_factor'],
+                self.load_balancing_scheduler['base_coef']
+            )
+            moe_layer.load_balancing_loss_coef = new_coef
+            self.console.print(f"[green]🔧 Decreased load balancing coef to {new_coef:.4f}[/green]")
+            
+        # Logar coeficiente atual para monitoramento
+        self.console.log(f"Current load balancing coef: {current_coef:.4f}")
+        
+        # Garantir que o coeficiente não fique abaixo de um limite mínimo
+        min_coef = 0.01
+        if moe_layer.load_balancing_loss_coef < min_coef:
+            moe_layer.load_balancing_loss_coef = min_coef
+            self.console.print(f"[red]⚠️ Load balancing coef adjusted to minimum value: {min_coef}[/red]")
+
+# Adicionando as classes MoE que estão faltando
 class ExpertNetwork(nn.Module):
     """Rede especialista individual para MoE"""
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, output_dim)
         )
+        
+        # Inicialização diversificada para cada especialista
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Inicializa pesos com diferentes estratégias para diversidade"""
+        for i, layer in enumerate(self.network):
+            if isinstance(layer, nn.Linear):
+                if i == 0:  # Primeira camada
+                    nn.init.xavier_uniform_(layer.weight, gain=1.0)
+                elif i == 2:  # Segunda camada
+                    nn.init.kaiming_uniform_(layer.weight, mode='fan_in', nonlinearity='relu')
+                else:  # Última camada
+                    nn.init.xavier_normal_(layer.weight, gain=0.1)
+                nn.init.constant_(layer.bias, 0.0)
     
     def forward(self, x):
         return self.network(x)
@@ -678,20 +874,45 @@ class GatingNetwork(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        self.gate = nn.Linear(input_dim, num_experts)
         
+        # Rede de gating com mais camadas para melhor capacidade de decisão
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_experts)
+        )
+        
+        # Inicialização para começar com distribuição uniforme
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Inicializa pesos para começar com distribuição mais uniforme"""
+        for layer in self.gate:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=0.1)
+                nn.init.constant_(layer.bias, 0.0)
+    
     def forward(self, x):
-        # Calcular logits para cada especialista
+        # Calcular logits do gate
         gate_logits = self.gate(x)
         
+        # Adicionar ruído para diversidade (apenas durante treinamento)
+        if self.training:
+            noise = torch.randn_like(gate_logits) * 0.1
+            gate_logits = gate_logits + noise
+        
         # Aplicar softmax para obter probabilidades
-        gate_probs = F.softmax(gate_logits, dim=-1)
+        gate_probs = F.softmax(gate_logits, dim=1)
         
         # Selecionar top-k especialistas
-        top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=1)
         
-        # Normalizar probabilidades dos top-k especialistas
-        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+        # Renormalizar as probabilidades top-k
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=1, keepdim=True)
         
         return top_k_probs, top_k_indices, gate_probs
 
@@ -716,11 +937,18 @@ class MoELayer(nn.Module):
         # Para regularização: loss de balanceamento
         self.load_balancing_loss_coef = 0.01
         
+        # Métricas para monitoramento
+        self.last_gate_probs = None
+        self.expert_usage_history = []
+    
     def forward(self, x):
         batch_size = x.shape[0]
         
         # Obter decisões do gate
         top_k_probs, top_k_indices, gate_probs = self.gate(x)
+        
+        # Armazenar para monitoramento
+        self.last_gate_probs = gate_probs.detach()
         
         # Calcular saídas dos especialistas selecionados
         expert_outputs = []
@@ -744,21 +972,60 @@ class MoELayer(nn.Module):
         return final_output, load_balancing_loss, gate_probs
     
     def _calculate_load_balancing_loss(self, gate_probs):
-        """Calcular loss de balanceamento para evitar que poucos especialistas dominem"""
+        """Calcular loss de balanceamento melhorado"""
         # Frequência de uso de cada especialista
         expert_usage = gate_probs.mean(dim=0)  # [num_experts]
         
-        # Queremos uma distribuição uniforme entre os especialistas
-        uniform_prob = 1.0 / self.num_experts
+        # Calcula múltiplos tipos de loss para melhor balanceamento
         
-        # Loss de balanceamento (divergência KL da distribuição uniforme)
-        load_balancing_loss = F.kl_div(
+        # 1. Loss de divergência KL da distribuição uniforme
+        uniform_prob = 1.0 / self.num_experts
+        kl_loss = F.kl_div(
             torch.log(expert_usage + 1e-8),
             torch.full_like(expert_usage, uniform_prob),
             reduction='sum'
         )
         
-        return self.load_balancing_loss_coef * load_balancing_loss
+        # 2. Loss de variância (penaliza especialistas muito usados ou pouco usados)
+        variance_loss = expert_usage.var()
+        
+        # 3. Loss de entropia (encoraja diversidade)
+        entropy = -(expert_usage * torch.log(expert_usage + 1e-8)).sum()
+        max_entropy = -torch.log(torch.tensor(1.0/self.num_experts)) * self.num_experts
+        entropy_loss = max_entropy - entropy
+        
+        # Combinar os diferentes tipos de loss
+        total_loss = (
+            0.5 * kl_loss + 
+            0.3 * variance_loss + 
+            0.2 * entropy_loss
+        )
+        
+        return self.load_balancing_loss_coef * total_loss
+    
+    def get_expert_usage_stats(self):
+        """Retorna estatísticas detalhadas sobre o uso dos especialistas"""
+        if self.last_gate_probs is not None:
+            usage = self.last_gate_probs.mean(dim=0).cpu().numpy()
+            
+            # Evitar divisão por zero
+            if np.any(np.isnan(usage)) or np.any(usage <= 0):
+                usage = np.full(self.num_experts, 1.0/self.num_experts)
+            
+            return {
+                'usage': usage,
+                'max_usage': float(np.max(usage)),
+                'min_usage': float(np.min(usage)),
+                'std_usage': float(np.std(usage)),
+                'coefficient_of_variation': float(np.std(usage) / (np.mean(usage) + 1e-8))
+            }
+        return {
+            'usage': np.full(self.num_experts, 1.0/self.num_experts),
+            'max_usage': 1.0/self.num_experts,
+            'min_usage': 1.0/self.num_experts,
+            'std_usage': 0.0,
+            'coefficient_of_variation': 0.0
+        }
 
 # Apply Wrappers to environment
 env = SkipFrame(env, skip=2)
@@ -769,23 +1036,16 @@ env = FrameStack(env, num_stack=4)
 save_dir = Path("checkpoints")
 save_dir.mkdir(parents=True, exist_ok=True)
 
-mario = Mario(state_dim=(4, 64, 64), action_dim=env.action_space.n if hasattr(env.action_space, 'n') else env.action_space.shape[0], save_dir=save_dir)
+mario = Mario(state_dim=(4, 64, 64), action_dim=9, save_dir=save_dir)
 
 logger = MetricLogger()
 
 episodes = 500
 
-# Initialize rich progress bar
-progress = Progress(
-    TextColumn("[bold blue]{task.description}"),
-    BarColumn(),
-    "[progress.percentage]{task.percentage:>3.0f}%",
-    TimeElapsedColumn(),
-    TimeRemainingColumn(),
-)
-training_task = progress.add_task("Training Mario Agent", total=episodes)
+# Start live display for Rich table
+logger.start_live_display()
 
-with progress:
+try:
     for e in range(episodes):
         state = env.reset()
         mario.last_position = None  # Reseta a última posição no início de cada episódio
@@ -793,6 +1053,7 @@ with progress:
         mario.coins_inicial = 0
         mario.vida_inicial = 2
         mario.max_pos = 0
+        
         # Play the game!
         while True:
             # Run agent on the state
@@ -801,21 +1062,19 @@ with progress:
             # Agent performs action
             next_state, reward, done, trunc, info = env.step(action)
 
-            reward = mario.calculate_reward(reward, done, info)
-
             # Remember
             mario.cache(state, next_state, action, reward, done, info)
 
             # Learn
             q, loss = mario.learn()
 
-            progress.update(training_task, description='Reward on turn: ' + str(reward))
-
-            # Get MoE metrics
-            moe_metrics = mario.net.get_moe_metrics()
-
             # Logging
+            moe_metrics = mario.net.get_moe_metrics()
             logger.log_step(reward, loss, q, moe_metrics)
+            
+            # Atualizar tabela a cada 50 steps para ver progresso em tempo real
+            if mario.curr_step % 50 == 0:
+                logger.update_live_display(e, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
 
             # Update state
             state = next_state
@@ -824,15 +1083,32 @@ with progress:
             if done or info["flag_get"]:
                 break
 
-        # Update progress bar
-        progress.update(training_task, advance=1)
+        # Coletar métricas MoE finais do episódio
+        moe_metrics = mario.net.get_moe_metrics()
+        
+        # Atualizar display live com informações finais do episódio ANTES de resetar
+        logger.update_live_display(e, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
+        
+        # Pequena pausa para garantir que a atualização seja visível
+        import time
+        time.sleep(0.1)
+        
+        # Marcar fim do episódio (isso reseta as métricas do episódio atual)
         logger.log_episode()
-        logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
-        # Imprimir estatísticas detalhadas do MoE a cada 10 episódios
-        if e % 10 == 0:
-            mario.print_moe_stats(e)
+        # Forçar uma segunda atualização do display após log_episode para mostrar o episódio completado
+        logger.update_live_display(e+1, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
 
-    mario.save()
-plt.close()  # Fechar a figura ao final do treinamento
+        # Imprimir estatísticas do MoE a cada 10 episódios (em console separado) - DESABILITADO: agora na tabela Rich
+        # if e % 10 == 0:
+        #     mario.print_moe_stats(e)
+
+        if e % 20 == 0:
+            logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, moe_metrics=moe_metrics, mario_net=mario.net)
+
+        mario.save()
+
+finally:
+    # Stop live display when training finishes
+    logger.stop_live_display()
 
