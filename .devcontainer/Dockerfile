@@ -1,57 +1,26 @@
-# Use uma imagem base Python oficial
-FROM mcr.microsoft.com/devcontainers/python:1-3.12-bullseye
+# Simple DevContainer Dockerfile using UV and pyproject.toml
+FROM python:3.11-slim
 
-# Instalar dependências do sistema para pygame, OpenCV e outras bibliotecas
-RUN apt-get update && apt-get install -y \
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instalar dependências do sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
     build-essential \
-    cmake \
-    pkg-config \
-    libsdl2-dev \
-    libsdl2-image-dev \
-    libsdl2-mixer-dev \
-    libsdl2-ttf-dev \
-    libfreetype6-dev \
-    libportmidi-dev \
-    libjpeg-dev \
-    libavformat-dev \
-    libavcodec-dev \
-    libswscale-dev \
-    libavutil-dev \
-    libgtk-3-dev \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libgdk-pixbuf2.0-dev \
-    libatlas-base-dev \
-    gfortran \
-    ffmpeg \
-    x11-apps \
-    && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
-# Instalar UV
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
+# Instalar UV (Astral)
+RUN curl -LsSf https://astral.sh/uv/install.sh | bash
 
-# Definir variáveis de ambiente para display (para Codespaces)
-ENV DISPLAY=:0
-ENV SDL_VIDEODRIVER=x11
+# Adicionar UV ao PATH
+ENV PATH="/root/.local/bin:${PATH}"
 
-# Criar diretório de trabalho
-WORKDIR /workspaces/MarioBrosAgent
+# Definir diretório de trabalho
+WORKDIR /workspace
 
-# Copiar arquivos de configuração
-COPY pyproject.toml ./
+# Copiar arquivos do projeto
+COPY . /workspace
 
-# Criar e ativar ambiente virtual, instalar dependências
-RUN uv venv && \
-    . .venv/bin/activate && \
-    uv pip install -e .
-
-# Configurar o ambiente virtual como padrão
-ENV VIRTUAL_ENV=/workspaces/MarioBrosAgent/.venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
-# Expor portas para Jupyter e TensorBoard
-EXPOSE 8888 6006
-
-# Comando padrão
-CMD ["/bin/bash"]
+# Comando padrão para manter o container ativo até o VS Code anexar
+CMD ["sleep", "infinity"]
