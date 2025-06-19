@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import math
 from torchvision import transforms as T
+import pytorch_optimizer as opts
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -249,9 +250,8 @@ class MarioNet(nn.Module):
             features = self.feature_extractor(input)
             output, load_balancing_loss, gate_probs = self.moe_layer(features)
             
-            # Armazenar métricas para monitoramento (com verificação de segurança)
-            loss_value = load_balancing_loss.item()
-            self.last_load_balancing_loss = np.nan_to_num(loss_value, nan=0.0, posinf=0.0, neginf=0.0)
+            # Armazenar métricas para monitoramento
+            self.last_load_balancing_loss = load_balancing_loss.item()
             self.last_gate_probs = gate_probs.detach()
             
             return output
@@ -266,23 +266,10 @@ class MarioNet(nn.Module):
             # Calcular distribuição de uso dos especialistas
             expert_usage = self.last_gate_probs.mean(dim=0).cpu().numpy()
             
-            # Verificar e corrigir valores NaN ou inválidos
-            expert_usage = np.nan_to_num(expert_usage, nan=1.0/6.0, posinf=1.0, neginf=0.0)
-            expert_usage = np.clip(expert_usage, 1e-8, 1.0)  # Garantir valores válidos
-            expert_usage = expert_usage / expert_usage.sum()  # Normalizar para somar 1
-            
-            # Calcular entropia de forma segura
-            log_usage = np.log(expert_usage + 1e-8)
-            entropy = -np.sum(expert_usage * log_usage)
-            entropy = np.nan_to_num(entropy, nan=0.0)  # Converter NaN para 0
-            
-            # Garantir que load_balancing_loss seja um valor válido
-            load_balancing_loss = np.nan_to_num(self.last_load_balancing_loss, nan=0.0)
-            
             return {
-                'load_balancing_loss': float(load_balancing_loss),
+                'load_balancing_loss': self.last_load_balancing_loss,
                 'expert_usage': expert_usage,
-                'expert_entropy': float(entropy)
+                'expert_entropy': -np.sum(expert_usage * np.log(expert_usage + 1e-8))
             }
         return None
 
@@ -445,20 +432,6 @@ class Mario(MarioB):
         self.coins_inicial = 0
         self.vida_inicial = 2
 
-        # Configurações de debug e estatísticas
-        self.debug_rewards = False  # Ativar para ver breakdown das recompensas
-        self.stuck_counter = 0
-        self.last_y_pos = 0
-        
-        # Estatísticas de comportamento
-        self.behavior_stats = {
-            'coins_collected_total': 0,
-            'enemies_killed_total': 0,
-            'max_distance': 0,
-            'total_exploration_moves': 0,
-            'times_stuck': 0
-        }
-
         self.optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01, momentum=0.9, weight_decay=0.01)
         self.loss_fn = torch.nn.MSELoss()
         if self.checkpoint_path.exists():
@@ -486,10 +459,8 @@ class Mario(MarioB):
         # Loss principal (Q-learning)
         q_loss = self.loss_fn(td_estimate, td_target)
         
-        # Loss de balanceamento do MoE (com verificação de segurança)
+        # Loss de balanceamento do MoE
         load_balancing_loss = self.net.last_load_balancing_loss
-        if np.isnan(load_balancing_loss) or np.isinf(load_balancing_loss):
-            load_balancing_loss = 0.0
         
         # Loss total
         total_loss = q_loss + load_balancing_loss
@@ -504,115 +475,50 @@ class Mario(MarioB):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
     def calculate_reward(self, reward, done, info):
-        """Sistema de recompensas refinado para incentivar coleta de itens"""
-        # Componentes de recompensa
         progress_reward = 0
         life_reward = 0
         coin_reward = 0
         score_reward = 0
-        exploration_reward = 0
-        time_penalty = -0.005  # Penalidade leve por tempo
-        
-        # === RECOMPENSA DE PROGRESSO (reduzida para balancear com itens) ===
+        time_penalty = -0.01  # Reduzido para -0.01
+
+        # Recompensa baseada no progresso
         if self.last_position is not None:
-            horizontal_progress = info["x_pos"] - self.last_position
-            
-            # Recompensa apenas por progresso significativo
-            if horizontal_progress > 5:  # Movimento mínimo
-                progress_reward = min(horizontal_progress / 10.0, 1.0)  # Max 1.0
+            progress = (info["x_pos"] - self.last_position)/3
+
+            if progress > 1:
+                progress_reward = progress
                 self.max_pos = max(self.max_pos, info["x_pos"])
-            elif horizontal_progress < -10:  # Penalizar muito retrocesso
-                progress_reward = -0.5
+
         else:
             self.last_position = info["x_pos"]
             self.max_pos = info["x_pos"]
 
-        # === RECOMPENSA POR COLETA DE MOEDAS (aumentada significativamente) ===
-        coins_collected = info["coins"] - self.coins_inicial
-        if coins_collected > 0:
-            # Recompensa alta por cada moeda coletada
-            coin_reward = coins_collected * 5.0  # 5 pontos por moeda
-            # Bonus extra por coletar múltiplas moedas
-            if coins_collected > 1:
-                coin_reward += coins_collected * 2.0  # Bonus de 2 pontos extras
-            
-            # Atualizar estatísticas
-            self.behavior_stats['coins_collected_total'] += coins_collected
-        self.coins_inicial = info["coins"]
-
-        # === RECOMPENSA POR PONTUAÇÃO (eliminar inimigos/quebrar blocos) ===
-        score_increase = float(info["score"] - self.score_inicial)
-        if score_increase > 0:
-            # Recompensa por pontuação (inimigos, blocos, etc.)
-            score_reward = score_increase / 100.0  # Normalizar pontuação
-            # Bonus para pontuações altas (combos, multiple kills)
-            if score_increase > 1000:
-                score_reward += 2.0  # Bonus por combo/multiple kills
-            
-            # Estimar inimigos mortos (aproximadamente)
-            estimated_kills = max(0, int(score_increase / 100))
-            self.behavior_stats['enemies_killed_total'] += estimated_kills
-        self.score_inicial = float(info["score"])
-
-        # === RECOMPENSA POR EXPLORAÇÃO (incentivar movimento vertical) ===
-        # Incentivar pulos e exploração vertical
-        current_y = info.get("y_pos", 0)
-        if hasattr(self, 'last_y_pos'):
-            y_movement = abs(current_y - self.last_y_pos)
-            if y_movement > 10:  # Movimento vertical significativo
-                exploration_reward = 0.3  # Pequena recompensa por exploração
-                self.behavior_stats['total_exploration_moves'] += 1
-        self.last_y_pos = current_y
-
-        # === RECOMPENSA POR COMPLETAR NÍVEL ===
-        completion_reward = 0
+        # Recompensa por completar o nível
         if info.get("flag_get", False):
-            completion_reward = 100.0  # Grande recompensa por completar
+            reward += 50  # Reduzido para 50
 
-        # === PENALIDADE/RECOMPENDA POR VIDA ===
+        # Recompensa/Punição por Vida
         if 'life' in info:
             life_change = float(int(info["life"]) - int(self.vida_inicial))
             if life_change > 0:
-                life_reward = 50.0  # Ganhar vida (1-up, cogumelo)
+                life_reward = 100  # Reduzido para 10
             elif life_change < 0:
-                life_reward = -25.0  # Perder vida
+                life_reward = -150  # Reduzido para -5
             self.vida_inicial = info["life"]
 
-        # === PENALIDADES ESPECIAIS ===
-        # Penalizar ficar parado muito tempo
-        stuck_penalty = 0
-        if abs(info["x_pos"] - self.last_position) < 2:
-            self.stuck_counter += 1
-            if self.stuck_counter > 30:  # Parado por 30 steps
-                stuck_penalty = -1.0
-                self.behavior_stats['times_stuck'] += 1
-        else:
-            self.stuck_counter = 0
-        
-        # Atualizar distância máxima
-        self.behavior_stats['max_distance'] = max(self.behavior_stats['max_distance'], info["x_pos"])
+        # Recompensa por coletar moedas
+        coin_reward = info["coins"] - self.coins_inicial
+        self.coins_inicial = info["coins"]
 
-        # === CALCULAR RECOMPENSA TOTAL ===
-        total_reward = (
-            reward +  # Recompensa base do ambiente
-            progress_reward +
-            coin_reward +
-            score_reward +
-            exploration_reward +
-            completion_reward +
-            life_reward +
-            time_penalty +
-            stuck_penalty
-        )
+        # Recompensa por eliminar inimigos
+        score_increase = float(info["score"] - self.score_inicial)/2
+        score_reward = score_increase
+        self.score_inicial = float(info["score"])
 
-        # Logging detalhado das recompensas (opcional, para debug)
-        if hasattr(self, 'debug_rewards') and self.debug_rewards:
-            print(f"Reward breakdown: Progress={progress_reward:.2f}, "
-                  f"Coins={coin_reward:.2f}, Score={score_reward:.2f}, "
-                  f"Exploration={exploration_reward:.2f}, Life={life_reward:.2f}, "
-                  f"Total={total_reward:.2f}")
+        # Soma as recompensas
+        reward += progress_reward + life_reward + coin_reward + score_reward + time_penalty
 
-        return total_reward
+        return reward
 
     def cache(self, state, next_state, action, reward, done, info):
         """
@@ -711,59 +617,14 @@ class Mario(MarioB):
             
         return action
 
-    def save_training_report(self):
-        """Salva um relatório detalhado do treinamento"""
-        import json
-        from datetime import datetime
-        
-        report = {
-            'timestamp': datetime.now().isoformat(),
-            'training_config': {
-                'gamma': self.gamma,
-                'learning_rate': self.optimizer.param_groups[0]['lr'],
-                'batch_size': self.batch_size,
-                'burnin': self.burnin,
-                'learn_every': self.learn_every,
-                'sync_every': self.sync_every
-            },
-            'moe_architecture': {
-                'num_experts': 6,
-                'top_k': 2,
-                'load_balancing_coef': 0.01
-            },
-            'behavior_stats': self.behavior_stats,
-            'current_step': self.curr_step,
-            'exploration_rate': self.exploration_rate
-        }
-        
-        report_path = self.checkpoint_path.parent / "training_report.json"
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
-        
-        print(f"Training report saved to {report_path}")
-
     def save(self):
-        checkpoint_data = {
-            'model': self.net.state_dict(),
-            'exploration_rate': self.exploration_rate,
-            'behavior_stats': self.behavior_stats,
-            'current_step': self.curr_step
-        }
-        torch.save(checkpoint_data, self.checkpoint_path)
+        torch.save(dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate), self.checkpoint_path)
         print(f"MarioNet salvo em {self.checkpoint_path} no passo {self.curr_step}")
-        
-        # Salvar relatório de treinamento a cada save
-        self.save_training_report()
 
     def load(self):
         checkpoint = torch.load(self.checkpoint_path)
         self.net.load_state_dict(checkpoint["model"])
         self.exploration_rate = checkpoint["exploration_rate"]
-        
-        # Carregar estatísticas se disponíveis
-        if "behavior_stats" in checkpoint:
-            self.behavior_stats = checkpoint["behavior_stats"]
-        
         print(f"Checkpoint carregado de {self.checkpoint_path}")
 
     def print_moe_stats(self, episode):
@@ -779,54 +640,18 @@ class Mario(MarioB):
             expert_usage = moe_metrics['expert_usage']
             self.console.print("[yellow]Expert Usage Distribution:[/yellow]")
             for i, usage in enumerate(expert_usage):
-                # Verificar se usage é válido
-                if np.isnan(usage) or np.isinf(usage):
-                    usage = 1.0/6.0  # Valor padrão uniforme
-                
-                usage = max(0.0, min(1.0, usage))  # Garantir que está entre 0 e 1
                 bar_length = int(usage * 50)  # Barra de 50 caracteres
-                bar_length = max(0, min(50, bar_length))  # Garantir que está entre 0 e 50
-                
                 bar = "█" * bar_length + "░" * (50 - bar_length)
                 self.console.print(f"  Expert {i+1}: [{bar}] {usage:.3f}")
             
-            # Mostrar especialistas mais e menos usados (com verificação de segurança)
-            valid_usage = np.nan_to_num(expert_usage, nan=1.0/6.0)
-            if len(valid_usage) > 0 and not np.all(valid_usage == valid_usage[0]):
-                most_used = np.argmax(valid_usage)
-                least_used = np.argmin(valid_usage)
-                self.console.print(f"[green]Most used expert:[/green] Expert {most_used+1} ({valid_usage[most_used]:.3f})")
-                self.console.print(f"[red]Least used expert:[/red] Expert {least_used+1} ({valid_usage[least_used]:.3f})")
-            else:
-                self.console.print("[yellow]All experts have equal usage[/yellow]")
+            # Mostrar especialistas mais e menos usados
+            most_used = np.argmax(expert_usage)
+            least_used = np.argmin(expert_usage)
+            self.console.print(f"[green]Most used expert:[/green] Expert {most_used+1} ({expert_usage[most_used]:.3f})")
+            self.console.print(f"[red]Least used expert:[/red] Expert {least_used+1} ({expert_usage[least_used]:.3f})")
             print()
 
-    def print_behavior_stats(self, episode):
-        """Imprime estatísticas detalhadas de comportamento do Mario"""
-        self.console.print("\n[bold magenta]🎮 Mario Behavior Statistics[/bold magenta]")
-        self.console.print(f"[yellow]Episode:[/yellow] {episode}")
-        self.console.print(f"[yellow]Total Coins Collected:[/yellow] {self.behavior_stats['coins_collected_total']}")
-        self.console.print(f"[yellow]Total Enemies Killed:[/yellow] {self.behavior_stats['enemies_killed_total']}")
-        self.console.print(f"[yellow]Max Distance Reached:[/yellow] {self.behavior_stats['max_distance']}")
-        self.console.print(f"[yellow]Exploration Moves:[/yellow] {self.behavior_stats['total_exploration_moves']}")
-        self.console.print(f"[yellow]Times Got Stuck:[/yellow] {self.behavior_stats['times_stuck']}")
-        
-        # Calcular eficiência de coleta
-        if self.behavior_stats['max_distance'] > 0:
-            coin_efficiency = self.behavior_stats['coins_collected_total'] / max(self.behavior_stats['max_distance'], 1) * 1000
-            self.console.print(f"[yellow]Coin Collection Efficiency:[/yellow] {coin_efficiency:.2f} coins/1000px")
-        
-        print()
-
-    def reset_episode_stats(self):
-        """Reseta estatísticas do episódio"""
-        self.max_pos = 40
-        self.score_inicial = 0
-        self.coins_inicial = 0
-        self.vida_inicial = 2
-        self.stuck_counter = 0
-        self.last_y_pos = 0
-
+    # ...existing code...
 class ExpertNetwork(nn.Module):
     """Rede especialista individual para MoE"""
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
@@ -960,10 +785,11 @@ training_task = progress.add_task("Training Mario Agent", total=episodes)
 with progress:
     for e in range(episodes):
         state = env.reset()
-        # Usar o novo método para resetar estatísticas
-        mario.reset_episode_stats()
         mario.last_position = None  # Reseta a última posição no início de cada episódio
-        
+        mario.score_inicial = 0
+        mario.coins_inicial = 0
+        mario.vida_inicial = 2
+        mario.max_pos = 0
         # Play the game!
         while True:
             # Run agent on the state
@@ -1000,16 +826,9 @@ with progress:
         logger.log_episode()
         logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
-        # Imprimir estatísticas detalhadas do MoE e comportamento a cada 10 episódios
+        # Imprimir estatísticas detalhadas do MoE a cada 10 episódios
         if e % 10 == 0:
             mario.print_moe_stats(e)
-            mario.print_behavior_stats(e)
-            
-        # Ativar debug de recompensas nos primeiros episódios para monitoramento
-        if e < 5:
-            mario.debug_rewards = True
-        else:
-            mario.debug_rewards = False
 
     mario.save()
 plt.close()  # Fechar a figura ao final do treinamento
