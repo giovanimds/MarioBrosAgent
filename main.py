@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch_directml
 import math
 from torchvision import transforms as T
 import pytorch_optimizer as opts
@@ -32,7 +31,7 @@ from rich.progress import Progress, TextColumn, BarColumn, TimeRemainingColumn, 
 
 # Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
 # env = gym_super_mario_bros.make("SuperMarioBrosRandomStages-v0", render_mode='human', apply_api_compatibility=True)
-env = gym_super_mario_bros.make("SuperMarioBros-v3", render_mode='human', apply_api_compatibility=True)
+env = gym_super_mario_bros.make("SuperMarioBros-v3", render_mode=None, apply_api_compatibility=True)
 
 print(gym.envs.registry.keys())
 
@@ -169,8 +168,7 @@ class MarioNet(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
-        self.device = torch_directml.device()
-        # self.device = 'cpu'
+        self.device = torch.device('cpu')
         # Self-Attention
         self.attention = SelfAttentionLayer(
             embed_dim=h*w,  # Deve corresponder ao número de canais
@@ -294,8 +292,7 @@ class MarioB:
         self.action_dim = action_dim
         self.save_dir = save_dir
 
-        self.device = torch_directml.device()
-        # self.device = 'cpu'
+        self.device = torch.device('cpu')
         # Mario's DNN to predict the most optimal action - we implement this in the Learn section
         self.net = MarioNet(self.state_dim, self.action_dim).float()
         self.net = self.net.to(device=self.device)

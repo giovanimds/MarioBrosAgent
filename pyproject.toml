@@ -10,7 +10,7 @@ dependencies = [
     "torchvision",
     "pytorch-optimizer",
     "pillow",
-    "numpy",
+    "numpy<2",
     "gym",
     "nes-py",
     "gym-super-mario-bros",
