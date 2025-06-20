@@ -182,10 +182,10 @@ class MarioNet(nn.Module):
         # Camada MoE com 6 especialistas e top-2
         self.moe_layer = MoELayer(
             input_dim=feature_dim,
-            hidden_dim=512,
+            hidden_dim=128,
             output_dim=output_dim,
-            num_experts=6,
-            top_k=2
+            num_experts=12,
+            top_k=4
         )
         
         # Armazenar loss de balanceamento para treinamento
@@ -198,10 +198,10 @@ class MarioNet(nn.Module):
             self._build_cnn_features(c, h, w),
             MoELayer(
                 input_dim=feature_dim,
-                hidden_dim=512,
+                hidden_dim=128,
                 output_dim=output_dim,
-                num_experts=6,
-                top_k=2
+                num_experts=12,
+                top_k=6
             )
         )
         self.target.load_state_dict(self.online.state_dict())
@@ -459,19 +459,7 @@ class MetricLogger:
         # Atualizar display live se estiver ativo
         if self.live:
             self.update_live_display(episode, moe_metrics, mario_net)
-        else:
-            # Fallback para console normal
-            self.console.print(
-                f":video_game: [bold green]Episode {episode}[/bold green] - "
-                f"[cyan]Step {step}[/cyan] - "
-                f":chart_with_upwards_trend: Epsilon [yellow]{epsilon:.3f}[/yellow] - "
-                f":trophy: Mean Reward [magenta]{mean_ep_reward}[/magenta] - "
-                f":stopwatch: Mean Length [blue]{mean_ep_length}[/blue] - "
-                f":bar_chart: Mean Loss [red]{mean_ep_loss}[/red] - "
-                f":brain: Mean Q Value [green]{mean_ep_q}[/green] - "
-                f":hourglass: Time Delta [cyan]{time_since_last_record}[/cyan] - "
-                f":calendar: Time [bold]{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}[/bold]"
-            )
+
 
 class MarioB:
     def __init__(self, state_dim, action_dim, save_dir):
@@ -542,7 +530,7 @@ class Mario(MarioB):
         self.vida_inicial = 2
 
         # Usar Adam padrão do PyTorch ao invés de RAdam para evitar problemas de estado
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.001, weight_decay=0.01)
+        self.optimizer = opts.ASGD(self.net.parameters(), lr=0.001, weight_decay=0.01)
         self.loss_fn = torch.nn.MSELoss()
         
         # Adicionando scheduler dinâmico para load balancing
@@ -611,9 +599,9 @@ class Mario(MarioB):
         if 'life' in info:
             life_change = float(int(info["life"]) - int(self.vida_inicial))
             if life_change > 0:
-                life_reward = 100  # Reduzido para 10
+                life_reward = 10  # Reduzido para 10
             elif life_change < 0:
-                life_reward = -150  # Reduzido para -5
+                life_reward = -5  # Reduzido para -5
             self.vida_inicial = info["life"]
 
         # Recompensa por coletar moedas
@@ -736,7 +724,10 @@ class Mario(MarioB):
         print(f"MarioNet salvo em {self.checkpoint_path} no passo {self.curr_step}")
 
     def load(self):
-        checkpoint = torch.load(self.checkpoint_path, weights_only=False)
+        try:
+            checkpoint = torch.load(self.checkpoint_path, weights_only=False)
+        except:
+            return
         self.net.load_state_dict(checkpoint["model"])
         self.exploration_rate = checkpoint["exploration_rate"]
         print(f"Checkpoint carregado de {self.checkpoint_path}")
@@ -879,10 +870,10 @@ class GatingNetwork(nn.Module):
         self.gate = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(128, num_experts)
         )
         
