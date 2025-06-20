@@ -30,7 +30,7 @@ os.environ["HSA_OVERRIDE_GFX_VERSION"] = "10.3.0"  # Fixes AMD GPU issue with Py
 
 # Initialize Super Mario environment (in v0.26 change render mode to 'human' to see results on the screen)
 # env = gym_super_mario_bros.make("SuperMarioBrosRandomStages-v0", render_mode='human', apply_api_compatibility=True)
-env = gym_super_mario_bros.make("SuperMarioBros-v3", render_mode=None, apply_api_compatibility=True)
+env = gym_super_mario_bros.make("SuperMarioBros-v0", render_mode='human', apply_api_compatibility=True)
 
 # print(gym.envs.registry.keys())
 
@@ -165,50 +165,64 @@ class SelfAttentionLayer(nn.Module):
 
 
 class MarioNet(nn.Module):
-    """CNN com arquitetura Mixture of Experts (MoE) - 6 especialistas, top-2"""
+    """CNN com arquitetura Mixture of Experts (MoE) melhorada - 16 especialistas, top-4"""
     def __init__(self, input_dim, output_dim):
         super().__init__()
         c, h, w = input_dim
         self.device = torch.device('cpu')
-        
-        # Extrair features com CNN
+
+        # Número de experts e configurações
+        self.num_experts = 16  # Aumentado para 16 experts
+        self.top_k = 8  # Mantido em 4 para favorecer maior competição
+
+        # Extrair features com CNN melhorada
         self.feature_extractor = self._build_cnn_features(c, h, w)
-        
+
         # Calcular dimensão das features após CNN
         with torch.no_grad():
             dummy_input = torch.randn(1, c, h, w)
             feature_dim = self.feature_extractor(dummy_input).shape[1]
-        
-        # Camada MoE com 6 especialistas e top-2
+
+        # Camada MoE com mais especialistas e melhor balanceamento
         self.moe_layer = MoELayer(
             input_dim=feature_dim,
-            hidden_dim=128,
+            hidden_dim=192,  # Aumentado de 128 para 192
             output_dim=output_dim,
-            num_experts=12,
-            top_k=4
+            num_experts=self.num_experts,
+            top_k=self.top_k
         )
-        
+
         # Armazenar loss de balanceamento para treinamento
         self.last_load_balancing_loss = 0.0
         self.last_gate_probs = None
-        
+
+        # Atribuir IDs aos especialistas para inicialização diversificada
+        for i, expert in enumerate(self.moe_layer.experts):
+            expert.expert_id = i
+
         # Criar modelos online e target
         self.online = nn.Sequential(self.feature_extractor, self.moe_layer)
+
+        # Target com configuração diferente para aumentar estabilidade
+        # - Usa mais especialistas no top-k para ter previsões mais suaves
         self.target = nn.Sequential(
             self._build_cnn_features(c, h, w),
             MoELayer(
                 input_dim=feature_dim,
-                hidden_dim=128,
+                hidden_dim=192,
                 output_dim=output_dim,
-                num_experts=12,
-                top_k=6
+                num_experts=self.num_experts,
+                top_k=self.top_k + 2  # Target usa mais experts no ensemble
             )
         )
         self.target.load_state_dict(self.online.state_dict())
-        
+
         # Congelar parâmetros do target
         for p in self.target.parameters():
             p.requires_grad = False
+
+        # Adicionar contador de passos para tracking
+        self.step_counter = 0
 
     def _build_cnn_features(self, c, h, w):
         """Construir as camadas CNN para extração de features"""
@@ -244,19 +258,50 @@ class MarioNet(nn.Module):
         )
 
     def forward(self, input, model):
+        self.step_counter += 1
+
         if model == "online":
+            # Extrair features
             features = self.feature_extractor(input)
+
+            # Processar com MoE
             output, load_balancing_loss, gate_probs = self.moe_layer(features)
-            
+
             # Armazenar métricas para monitoramento
             self.last_load_balancing_loss = load_balancing_loss.item()
             self.last_gate_probs = gate_probs.detach()
-            
+
+            # Ajustar coeficiente de balanceamento periodicamente
+            if self.step_counter % 500 == 0:
+                self.adjust_load_balancing_dynamically()
+
             return output
         elif model == "target":
             features = self.target[0](input)  # feature_extractor
             output, _, _ = self.target[1](features)  # moe_layer
             return output
+
+    def adjust_load_balancing_dynamically(self):
+        """Ajusta dinamicamente o coeficiente de balanceamento com base nas métricas atuais"""
+        stats = self.moe_layer.get_expert_usage_stats()
+
+        # Verificar indicadores de desbalanceamento
+        max_usage = stats['max_usage']
+        inactive_count = stats['inactive_count']
+        gini = stats.get('gini_coefficient', 0.5)  # Índice de desigualdade
+        current_coef = self.moe_layer.load_balancing_loss_coef
+
+        # Regras para ajuste dinâmico
+        if max_usage > 0.25 or inactive_count > self.num_experts // 4 or gini > 0.4:
+            # Desbalanceamento detectado - aumentar coeficiente
+            new_coef = min(current_coef * 1.2, 0.25)  # Máximo de 0.25
+            self.moe_layer.load_balancing_loss_coef = new_coef
+            print(f"🔼 Aumentando coeficiente de balanceamento: {current_coef:.4f} → {new_coef:.4f}")
+        elif max_usage < 0.15 and inactive_count < 2 and gini < 0.3:
+            # Bem balanceado - reduzir coeficiente gradualmente
+            new_coef = max(current_coef * 0.95, 0.02)  # Mínimo de 0.02
+            self.moe_layer.load_balancing_loss_coef = new_coef
+            print(f"🔽 Reduzindo coeficiente de balanceamento: {current_coef:.4f} → {new_coef:.4f}")
 
     def get_moe_metrics(self):
         """Retorna métricas do MoE para monitoramento"""
@@ -522,25 +567,39 @@ class Mario(MarioB):
         self.memory = TensorDictReplayBuffer(storage=ListStorage(10000))
         self.batch_size = 32
         self.plot_every = 1000
-        # self.fig, self.ax = plt.subplots()
         self.heatmap = None
         self.max_pos = 40
         self.score_inicial = 0
         self.coins_inicial = 0
         self.vida_inicial = 2
 
-        # Usar Adam padrão do PyTorch ao invés de RAdam para evitar problemas de estado
-        self.optimizer = opts.ASGD(self.net.parameters(), lr=0.001, weight_decay=0.01)
-        self.loss_fn = torch.nn.MSELoss()
-        
-        # Adicionando scheduler dinâmico para load balancing
+        # Otimizador com parâmetros melhorados para MoE
+        self.optimizer = opts.ASGD(
+            self.net.parameters(), 
+            lr=0.00075,  # Taxa de aprendizado reduzida para estabilidade
+            weight_decay=0.005  # Maior regularização
+        )
+        self.loss_fn = torch.nn.SmoothL1Loss()  # Huber loss mais robusta
+
+        # Scheduler dinâmico para balanceamento de carga
         self.load_balancing_scheduler = {
-            'base_coef': 0.1,
-            'max_coef': 0.5,
-            'imbalance_threshold': 0.4,
-            'adjustment_factor': 1.1,
-            'decay_factor': 0.99
+            'base_coef': 0.05,  # Valor base maior
+            'max_coef': 0.35,   # Valor máximo um pouco menor
+            'min_coef': 0.02,   # Valor mínimo
+            'imbalance_threshold': 0.25,  # Threshold mais sensível
+            'adjustment_factor': 1.15,   # Ajuste mais agressivo
+            'decay_factor': 0.985,       # Decaimento mais lento
+            'severe_imbalance_threshold': 0.35,  # Para ações emergenciais
+            'check_interval': 500  # Verificar a cada 500 passos
         }
+
+        # Contadores para monitoramento de balanceamento
+        self.balance_checks = 0
+        self.balance_adjustments = 0
+        self.severe_imbalance_count = 0
+
+        # Rastreamento de especialistas dominantes
+        self.dominant_experts_history = []
         
         if self.checkpoint_path.exists():
             self.load()
@@ -560,17 +619,127 @@ class Mario(MarioB):
         # Loss de balanceamento do MoE
         load_balancing_loss = self.net.last_load_balancing_loss
         
-        # Loss total
-        total_loss = q_loss + load_balancing_loss
-        
+        # Verificar se estamos em situação de desbalanceamento grave
+        moe_metrics = self.net.get_moe_metrics()
+        if moe_metrics and 'expert_usage' in moe_metrics:
+            expert_usage = moe_metrics['expert_usage']
+            max_usage = expert_usage.max() if hasattr(expert_usage, 'max') else max(expert_usage)
+
+            # Verificar condições de desbalanceamento e ajustar o peso do balanceamento
+            if max_usage > self.load_balancing_scheduler['severe_imbalance_threshold']:
+                self.severe_imbalance_count += 1
+                # Aumentar peso do balanceamento temporariamente
+                balance_weight = 2.0
+
+                # Log da situação
+                if self.severe_imbalance_count % 10 == 0:
+                    self.console.print(f"[bold red]⚠️ Severo desbalanceamento detectado! Especialista dominante: {max_usage:.2%}[/bold red]")
+            else:
+                # Peso normal
+                balance_weight = 1.0
+                self.severe_imbalance_count = max(0, self.severe_imbalance_count - 1)
+        else:
+            balance_weight = 1.0
+
+        # Loss total com peso adaptativo
+        total_loss = q_loss + (load_balancing_loss * balance_weight)
+
+        # Aplicar gradiente apenas para os experts usados na forward pass atual
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        # Clipar gradientes para estabilidade
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
+
+        # Aplicar otimização
         self.optimizer.step()
+
+        # Rastrear e ajustar especialistas dominantes periodicamente
+        if self.curr_step % self.load_balancing_scheduler['check_interval'] == 0:
+            self.check_expert_dominance()
         
         return total_loss.item()
 
     def sync_Q_target(self):
         self.net.target.load_state_dict(self.net.online.state_dict())
+
+    def check_expert_dominance(self):
+        """Monitora e gerencia especialistas dominantes ou inativos"""
+        self.balance_checks += 1
+
+        # Obter estatísticas de uso
+        stats = self.net.moe_layer.get_expert_usage_stats()
+        if not stats or 'usage' not in stats:
+            return
+
+        usage = stats['usage']
+        inactive_experts = stats.get('inactive_experts', [])
+        dominant_experts = stats.get('dominant_experts', [])
+
+        # Rastrear especialistas dominantes
+        if dominant_experts:
+            self.dominant_experts_history.append(set(dominant_experts))
+            if len(self.dominant_experts_history) > 10:
+                self.dominant_experts_history.pop(0)
+
+        # Verificar se há um padrão consistente de dominância
+        consistent_dominants = set()
+        if len(self.dominant_experts_history) >= 3:
+            # Encontrar especialistas que dominam consistentemente
+            for expert in range(self.net.moe_layer.num_experts):
+                if all(expert in history for history in self.dominant_experts_history[-3:]):
+                    consistent_dominants.add(expert)
+
+        # Medidas corretivas para balanceamento
+        if consistent_dominants or len(inactive_experts) > self.net.moe_layer.num_experts // 3:
+            self.balance_adjustments += 1
+
+            # Ajustar coeficiente de balanceamento
+            current_coef = self.net.moe_layer.load_balancing_loss_coef
+            new_coef = min(
+                current_coef * self.load_balancing_scheduler['adjustment_factor'],
+                self.load_balancing_scheduler['max_coef']
+            )
+            self.net.moe_layer.load_balancing_loss_coef = new_coef
+
+            # Log das ações tomadas
+            if consistent_dominants:
+                expert_ids = ", ".join([str(e+1) for e in consistent_dominants])
+                self.console.print(f"[yellow]⚠️ Experts {expert_ids} consistentemente dominantes. Ajustando balanceamento: {current_coef:.4f} → {new_coef:.4f}[/yellow]")
+
+            if len(inactive_experts) > self.net.moe_layer.num_experts // 3:
+                inactive_count = len(inactive_experts)
+                self.console.print(f"[yellow]⚠️ {inactive_count} experts inativos detectados. Ajustando balanceamento.[/yellow]")
+
+            # Ação mais drástica: Reinicializar pesos do gate quando há desbalanceamento severo
+            if max(usage) > 0.4 and self.balance_adjustments % 3 == 0:
+                self.reinitialize_gate_network()
+                self.console.print("[bold red]🔄 Reinicializando rede de gate para melhorar balanceamento![/bold red]")
+
+        # Se o balanceamento estiver bom, reduzir gradualmente o coeficiente
+        elif max(usage) < 0.2 and len(inactive_experts) < 2:
+            current_coef = self.net.moe_layer.load_balancing_loss_coef
+            # Só reduzir se o coeficiente atual for alto
+            if current_coef > self.load_balancing_scheduler['base_coef']:
+                new_coef = max(
+                    current_coef * self.load_balancing_scheduler['decay_factor'],
+                    self.load_balancing_scheduler['min_coef']
+                )
+                self.net.moe_layer.load_balancing_loss_coef = new_coef
+                self.console.print(f"[green]✓ Balanceamento estável. Ajustando coeficiente: {current_coef:.4f} → {new_coef:.4f}[/green]")
+
+    def reinitialize_gate_network(self):
+        """Reinicializa a rede de gate quando há desbalanceamento severo"""
+        # Salvar estado atual do gating para referência
+        old_gate_probs = self.net.moe_layer.last_gate_probs.detach() if self.net.moe_layer.last_gate_probs is not None else None
+
+        # Reinicializar pesos do gate
+        self.net.moe_layer.gate._initialize_weights()
+
+        # Aumentar escala de ruído temporariamente
+        if hasattr(self.net.moe_layer.gate, 'noise_scale'):
+            self.net.moe_layer.gate.noise_scale = min(self.net.moe_layer.gate.noise_scale * 2, 0.5)
+            self.console.print(f"[yellow]🔊 Ruído aumentado para {self.net.moe_layer.gate.noise_scale:.3f}[/yellow]")
 
     def calculate_reward(self, reward, done, info):
         progress_reward = 0
@@ -581,7 +750,7 @@ class Mario(MarioB):
 
         # Recompensa baseada no progresso
         if self.last_position is not None:
-            progress = (info["x_pos"] - self.last_position)/3
+            progress = (info["x_pos"] - self.last_position)/10
 
             if progress > 1:
                 progress_reward = progress
@@ -733,63 +902,146 @@ class Mario(MarioB):
         print(f"Checkpoint carregado de {self.checkpoint_path}")
 
     def print_moe_stats(self, episode):
-        """Imprime estatísticas detalhadas do MoE"""
+        """Imprime estatísticas detalhadas e avançadas do MoE"""
         moe_metrics = self.net.get_moe_metrics()
-        if moe_metrics:
-            self.console.print("\n[bold cyan]🧠 MoE Statistics[/bold cyan]")
-            self.console.print(f"[yellow]Episode:[/yellow] {episode}")
-            self.console.print(f"[yellow]Load Balancing Loss:[/yellow] {moe_metrics['load_balancing_loss']:.6f}")
-            self.console.print(f"[yellow]Expert Entropy:[/yellow] {moe_metrics['expert_entropy']:.4f}")
-            
-            # Obter estatísticas mais detalhadas do MoE
-            moe_layer = self.net.moe_layer
-            detailed_stats = moe_layer.get_expert_usage_stats()
-            
-            self.console.print(f"[yellow]Max Expert Usage:[/yellow] {detailed_stats['max_usage']:.3f}")
-            self.console.print(f"[yellow]Min Expert Usage:[/yellow] {detailed_stats['min_usage']:.3f}")
-            self.console.print(f"[yellow]Std Expert Usage:[/yellow] {detailed_stats['std_usage']:.3f}")
-            self.console.print(f"[yellow]Coefficient of Variation:[/yellow] {detailed_stats['coefficient_of_variation']:.3f}")
-            
-            # Aviso se há desbalanceamento severo
-            if detailed_stats['max_usage'] > 0.5:
-                self.console.print("[bold red]⚠️  SEVERE IMBALANCE DETECTED![/bold red]")
-                self.console.print(f"[red]One expert is dominating with {detailed_stats['max_usage']:.1%} usage[/red]")
-            elif detailed_stats['max_usage'] > 0.3:
-                self.console.print("[yellow]⚠️  Moderate imbalance detected[/yellow]")
-            
-            # Mostrar uso de cada especialista
-            expert_usage = detailed_stats['usage']
-            self.console.print("[yellow]Expert Usage Distribution:[/yellow]")
-            for i, usage in enumerate(expert_usage):
-                bar_length = int(usage * 50)  # Barra de 50 caracteres
-                bar = "█" * bar_length + "░" * (50 - bar_length)
-                
-                # Colorir baseado no uso
-                if usage > 0.4:
-                    color = "[red]"
-                elif usage > 0.25:
-                    color = "[yellow]"
-                elif usage < 0.05:
-                    color = "[dim]"
-                else:
-                    color = "[green]"
-                
-                self.console.print(f"  Expert {i+1}: {color}[{bar}] {usage:.3f}[/{color.strip('[]')}]")
-            
-            # Mostrar especialistas mais e menos usados
-            most_used = int(np.argmax(expert_usage))
-            least_used = int(np.argmin(expert_usage))
-            self.console.print(f"[green]Most used expert:[/green] Expert {most_used+1} ({expert_usage[most_used]:.3f})")
-            self.console.print(f"[red]Least used expert:[/red] Expert {least_used+1} ({expert_usage[least_used]:.3f})")
-            
-            # Sugestões para balanceamento
-            if detailed_stats['coefficient_of_variation'] > 1.0:
-                self.console.print("\n[bold yellow]💡 Balancing Suggestions:[/bold yellow]")
-                self.console.print("- Consider increasing load_balancing_loss_coef")
-                self.console.print("- Add more noise to gating network")
-                self.console.print("- Reduce learning rate temporarily")
-            
-            print()
+        if not moe_metrics:
+            self.console.print("[yellow]Sem métricas MoE disponíveis ainda[/yellow]")
+            return
+
+        # Obter estatísticas detalhadas
+        moe_layer = self.net.moe_layer
+        stats = moe_layer.get_expert_usage_stats()
+
+        # Cabeçalho com informações básicas
+        self.console.print("\n[bold cyan]🧠 Estatísticas do Mixture of Experts (MoE)[/bold cyan]")
+        self.console.print(f"[yellow]Episódio:[/yellow] {episode}")
+        self.console.print(f"[yellow]Passo:[/yellow] {self.curr_step}")
+
+        # Status geral de balanceamento
+        if stats['max_usage'] > 0.4:
+            status = "[bold red]SEVERO DESBALANCEAMENTO[/bold red]"
+        elif stats['max_usage'] > 0.25:
+            status = "[yellow]Desbalanceamento Moderado[/yellow]"
+        elif stats['max_usage'] > 0.15:
+            status = "[green]Balanceamento Razoável[/green]"
+        else:
+            status = "[bold green]Excelente Balanceamento[/bold green]"
+
+        self.console.print(f"[bold]Status de Balanceamento:[/bold] {status}")
+
+        # Métricas de configuração
+        self.console.print("\n[bold cyan]⚙️ Configuração Atual:[/bold cyan]")
+        self.console.print(f"[yellow]Número de Experts:[/yellow] {moe_layer.num_experts}")
+        self.console.print(f"[yellow]Top-K Selecionados:[/yellow] {moe_layer.top_k}")
+        self.console.print(f"[yellow]Coeficiente de Balanceamento:[/yellow] {moe_layer.load_balancing_loss_coef:.5f}")
+        self.console.print(f"[yellow]Escala de Ruído:[/yellow] {moe_layer.gate.noise_scale if hasattr(moe_layer.gate, 'noise_scale') else 0.1:.5f}")
+
+        # Métricas principais de desempenho
+        self.console.print("\n[bold cyan]📊 Métricas Principais:[/bold cyan]")
+        self.console.print(f"[yellow]Loss de Balanceamento:[/yellow] {moe_metrics['load_balancing_loss']:.6f}")
+        self.console.print(f"[yellow]Entropia dos Experts:[/yellow] {moe_metrics['expert_entropy']:.4f}")
+        self.console.print(f"[yellow]Uso Máximo de Expert:[/yellow] {stats['max_usage']:.3f} (Expert {np.argmax(stats['usage'])+1})")
+        self.console.print(f"[yellow]Uso Mínimo de Expert:[/yellow] {stats['min_usage']:.3f} (Expert {np.argmin(stats['usage'])+1})")
+
+        # Métricas avançadas
+        self.console.print("\n[bold cyan]🔍 Métricas Avançadas:[/bold cyan]")
+        self.console.print(f"[yellow]Coeficiente de Variação:[/yellow] {stats['coefficient_of_variation']:.3f}")
+        if 'gini_coefficient' in stats:
+            gini = stats['gini_coefficient']
+            gini_status = "[red]Alta Desigualdade[/red]" if gini > 0.4 else "[yellow]Desigualdade Média[/yellow]" if gini > 0.2 else "[green]Baixa Desigualdade[/green]"
+            self.console.print(f"[yellow]Coeficiente de Gini:[/yellow] {gini:.3f} {gini_status}")
+        if 'normalized_entropy' in stats:
+            norm_entropy = stats['normalized_entropy']
+            entropy_status = "[green]Excelente[/green]" if norm_entropy > 0.9 else "[yellow]Média[/yellow]" if norm_entropy > 0.7 else "[red]Baixa[/red]"
+            self.console.print(f"[yellow]Entropia Normalizada:[/yellow] {norm_entropy:.3f} {entropy_status}")
+
+        # Contagens de especialistas
+        inactive_count = stats.get('inactive_count', sum(1 for u in stats['usage'] if u < 0.01))
+        dominant_count = stats.get('dominant_count', sum(1 for u in stats['usage'] if u > 0.2))
+        self.console.print(f"[yellow]Experts Inativos (<1%):[/yellow] {inactive_count} de {moe_layer.num_experts}")
+        self.console.print(f"[yellow]Experts Dominantes (>20%):[/yellow] {dominant_count} de {moe_layer.num_experts}")
+
+        # Histórico de ajustes
+        self.console.print("\n[bold cyan]🔧 Histórico de Ajustes:[/bold cyan]")
+        self.console.print(f"[yellow]Verificações de Balanceamento:[/yellow] {self.balance_checks}")
+        self.console.print(f"[yellow]Ajustes Realizados:[/yellow] {self.balance_adjustments}")
+        self.console.print(f"[yellow]Episódios com Desbalanceamento Severo:[/yellow] {self.severe_imbalance_count}")
+
+        # Distribuição de uso dos especialistas
+        self.console.print("\n[bold cyan]📈 Distribuição de Uso dos Experts:[/bold cyan]")
+        expert_usage = stats['usage']
+        ideal_usage = 1.0 / moe_layer.num_experts
+
+        # Criar tabela para melhor visualização
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Expert", style="cyan", no_wrap=True)
+        table.add_column("Uso (%)", justify="right")
+        table.add_column("Visualização", no_wrap=True)
+        table.add_column("Status", no_wrap=True)
+
+        # Ordenar por uso
+        sorted_indices = np.argsort(expert_usage)[::-1]  # Ordem decrescente
+
+        for i, idx in enumerate(sorted_indices):
+            usage = expert_usage[idx]
+            bar_length = int(usage * 50)  # Barra de 50 caracteres
+            bar = "█" * bar_length + "░" * (50 - bar_length)
+
+            # Definir cores baseadas no desvio do ideal
+            ratio = usage / ideal_usage
+            if ratio > 3.0:
+                color = "[bold red]"
+                status = "🔥 Superutilizado"
+            elif ratio > 2.0:
+                color = "[red]"
+                status = "⚠️ Muito utilizado"
+            elif ratio > 1.5:
+                color = "[yellow]"
+                status = "⚡ Acima da média"
+            elif ratio < 0.2:
+                color = "[dim]"
+                status = "💤 Inativo"
+            elif ratio < 0.5:
+                color = "[blue]"
+                status = "❄️ Subutilizado"
+            else:
+                color = "[green]"
+                status = "✅ Balanceado"
+
+            table.add_row(
+                f"{idx+1}", 
+                f"{usage*100:.1f}%",
+                f"{color}[{bar}][/{color.strip('[]')}",
+                f"{color}{status}[/{color.strip('[]')}"
+            )
+
+        self.console.print(table)
+
+        # Análise de ações para melhorar balanceamento
+        self.console.print("\n[bold cyan]💡 Análise e Recomendações:[/bold cyan]")
+
+        if stats['max_usage'] > 0.35:
+            self.console.print("[yellow]🔸 Desbalanceamento significativo detectado[/yellow]")
+            self.console.print("[yellow]🔹 Ações automáticas implementadas:[/yellow]")
+            self.console.print(f"  - Coeficiente de balanceamento atual: {moe_layer.load_balancing_loss_coef:.4f}")
+            self.console.print(f"  - Escala de ruído atual: {moe_layer.gate.noise_scale if hasattr(moe_layer.gate, 'noise_scale') else 0.1:.4f}")
+
+            # Recomendações específicas
+            self.console.print("[yellow]🔹 Medidas recomendadas:[/yellow]")
+            if inactive_count > 3:
+                self.console.print("  - [red]Muitos experts inativos - reduzir número de experts ou aumentar top-k[/red]")
+            if stats['coefficient_of_variation'] > 1.0:
+                self.console.print("  - [red]Alta variabilidade - aumentar coeficiente de balanceamento[/red]")
+            if dominant_count > 0:
+                self.console.print("  - [red]Experts dominantes - aumentar ruído ou reinicializar rede de gate[/red]")
+        elif stats['max_usage'] < 0.15 and inactive_count < 2:
+            self.console.print("[green]✅ Balanceamento atual é bom![/green]")
+            if moe_layer.load_balancing_loss_coef > 0.03:
+                self.console.print("  - Pode-se reduzir gradualmente o coeficiente de balanceamento")
+        else:
+            self.console.print("[yellow]🔸 Balanceamento razoável - monitorando ajustes automáticos[/yellow]")
+
+        print()
 
     def adjust_load_balancing_coefficient(self):
         """Ajusta dinamicamente o coeficiente de load balancing baseado no desbalanceamento"""
@@ -826,81 +1078,182 @@ class Mario(MarioB):
             moe_layer.load_balancing_loss_coef = min_coef
             self.console.print(f"[red]⚠️ Load balancing coef adjusted to minimum value: {min_coef}[/red]")
 
+
 # Adicionando as classes MoE que estão faltando
 class ExpertNetwork(nn.Module):
-    """Rede especialista individual para MoE"""
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    """Rede especialista melhorada com arquitetura mais diversificada"""
+    def __init__(self, input_dim, hidden_dim, output_dim, expert_id=None):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        self.expert_id = expert_id  # Identificador do especialista
+        self.hidden_dim = hidden_dim
+
+        # Arquitetura base com skip connections
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+
+        # Camadas variadas por especialista para forçar especialização
+        # Usamos módulos diferentes para quebrar simetria entre experts
+        self.hidden1 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Dropout(0.15),
+            nn.Linear(hidden_dim, hidden_dim)
         )
-        
+
+        # Segunda camada com arquitetura diferente
+        self.hidden2 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),  # Usando SiLU (Swish) como ativação variada
+            nn.Dropout(0.15),
+            nn.Linear(hidden_dim, hidden_dim//2)
+        )
+
+        # Camada de saída
+        self.output_layer = nn.Linear(hidden_dim//2, output_dim)
+
         # Inicialização diversificada para cada especialista
         self._initialize_weights()
-    
+
+        # Inserir alguma não-linearidade específica por especialista
+        if expert_id is not None:
+            # Para quebrar simetria, adicione pequeno bias específico por expert
+            with torch.no_grad():
+                # Pequena perturbação determinística baseada no expert_id
+                seed_val = (expert_id * 1337) % 10000
+                torch.manual_seed(seed_val)
+                # Adicionar bias pequeno mas diferente para cada expert
+                self.input_layer.bias.add_(torch.randn_like(self.input_layer.bias) * 0.01)
+                self.output_layer.bias.add_(torch.randn_like(self.output_layer.bias) * 0.01)
+
     def _initialize_weights(self):
-        """Inicializa pesos com diferentes estratégias para diversidade"""
-        for i, layer in enumerate(self.network):
-            if isinstance(layer, nn.Linear):
-                if i == 0:  # Primeira camada
-                    nn.init.xavier_uniform_(layer.weight, gain=1.0)
-                elif i == 2:  # Segunda camada
-                    nn.init.kaiming_uniform_(layer.weight, mode='fan_in', nonlinearity='relu')
-                else:  # Última camada
-                    nn.init.xavier_normal_(layer.weight, gain=0.1)
-                nn.init.constant_(layer.bias, 0.0)
-    
+        """Inicialização especializada para cada camada"""
+        # Input layer - inicialização normal
+        nn.init.kaiming_normal_(self.input_layer.weight, nonlinearity='relu')
+        nn.init.constant_(self.input_layer.bias, 0.1)
+
+        # Output layer - inicialização cuidadosa
+        nn.init.xavier_normal_(self.output_layer.weight, gain=0.1)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
+        # Camadas escondidas
+        for module in [self.hidden1, self.hidden2]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+                    nn.init.constant_(layer.bias, 0.1)
+
     def forward(self, x):
-        return self.network(x)
+        # Processamento com residual connections
+        h0 = F.relu(self.input_layer(x))
+        h1 = self.hidden1(h0) + h0  # Residual connection
+        h2 = self.hidden2(h1)  # Sem residual aqui
+        output = self.output_layer(h2)
+        return output
 
 class GatingNetwork(nn.Module):
-    """Rede de gating para determinar quais especialistas usar"""
-    def __init__(self, input_dim, num_experts, top_k=2):
+    """Rede de gating melhorada com mecanismos para promover balanceamento"""
+    def __init__(self, input_dim, num_experts, top_k=4):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
-        
-        # Rede de gating com mais camadas para melhor capacidade de decisão
-        self.gate = nn.Sequential(
-            nn.Linear(input_dim, 256),
+        self.input_dim = input_dim
+
+        # Rede de gating mais expressiva com skip-connections
+        self.input_layer = nn.Linear(input_dim, 256)
+        self.hidden1 = nn.Sequential(
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_experts)
+            nn.Linear(256, 256)
         )
-        
-        # Inicialização para começar com distribuição uniforme
+        self.hidden2 = nn.Sequential(
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128)
+        )
+        self.output_layer = nn.Linear(128, num_experts)
+
+        # Camada de temperatura para controlar a suavidade da distribuição
+        self.temperature = nn.Parameter(torch.ones(1) * 1.0)
+
+        # Inicialização de pesos para distribuição inicial mais uniforme
         self._initialize_weights()
-    
+
+        # Histórico de ativação para monitoramento
+        self.activation_history = []
+        self.noise_scale = 0.15  # Escala de ruído inicial
+        self.noise_decay = 0.9995  # Decaimento do ruído
+
     def _initialize_weights(self):
-        """Inicializa pesos para começar com distribuição mais uniforme"""
-        for layer in self.gate:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight, gain=0.1)
-                nn.init.constant_(layer.bias, 0.0)
-    
+        """Inicialização especializada para distribuição mais uniforme"""
+        # Input layer - inicialização cuidadosa para evitar saturação
+        nn.init.xavier_uniform_(self.input_layer.weight, gain=0.5)
+        nn.init.constant_(self.input_layer.bias, 0.0)
+
+        # Output layer - inicialização especial para começar quase uniforme
+        nn.init.constant_(self.output_layer.weight, 0.0)
+        nn.init.constant_(self.output_layer.bias, 0.0)
+
+        # Camadas escondidas - inicialização normal
+        for module in [self.hidden1, self.hidden2]:
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+                    nn.init.constant_(layer.bias, 0.1)
+
     def forward(self, x):
-        # Calcular logits do gate
-        gate_logits = self.gate(x)
-        
-        # Adicionar ruído para diversidade (apenas durante treinamento)
+        # Processamento com skip connections
+        h0 = F.relu(self.input_layer(x))
+        h1 = self.hidden1(h0) + h0  # Residual connection
+        h2 = self.hidden2(h1)  # No residual aqui
+
+        # Logits dos gates com temperatura adaptativa
+        gate_logits = self.output_layer(h2)
+
+        # Guardar ativações para análise
         if self.training:
-            noise = torch.randn_like(gate_logits) * 0.1
-            gate_logits = gate_logits + noise
-        
+            self.activation_history.append(gate_logits.detach().cpu())
+            if len(self.activation_history) > 100:
+                self.activation_history.pop(0)
+
+        # Adicionar ruído para diversidade (apenas durante treinamento)
+        # Ruído proporcional aos valores para evitar distorção total
+        if self.training:
+            # Decair o ruído ao longo do tempo
+            self.noise_scale = max(self.noise_scale * self.noise_decay, 0.05)
+
+            # Ruído gaussiano padrão
+            standard_noise = torch.randn_like(gate_logits) * self.noise_scale
+
+            # Ruído adicional para especialistas subutilizados
+            if len(self.activation_history) > 10:
+                # Calcular uso médio recente
+                recent_activations = torch.cat([act.mean(dim=0, keepdim=True) for act in self.activation_history[-10:]], dim=0)
+                recent_probs = F.softmax(recent_activations, dim=1).mean(dim=0)
+
+                # Identificar especialistas menos usados
+                boost_factor = 1.0 / (recent_probs + 1e-5)  # Inverse probability
+                boost_factor = boost_factor / boost_factor.mean()  # Normalizar
+
+                # Aplicar boost aos especialistas menos utilizados
+                boost_noise = torch.randn_like(gate_logits) * boost_factor.unsqueeze(0) * self.noise_scale * 0.5
+
+                # Combinar ruídos
+                gate_logits = gate_logits + standard_noise + boost_noise
+            else:
+                gate_logits = gate_logits + standard_noise
+
+        # Aplicar temperatura para controlar a suavidade da distribuição
+        # Temperatura menor = distribuição mais acentuada
+        # Temperatura maior = distribuição mais suave
+        temperature = torch.clamp(self.temperature, 0.5, 5.0)
+        gate_logits = gate_logits / temperature
+
         # Aplicar softmax para obter probabilidades
         gate_probs = F.softmax(gate_logits, dim=1)
-        
+
         # Selecionar top-k especialistas
-        top_k_probs, top_k_indices = torch.topk(gate_probs, self.top_k, dim=1)
+        top_k_probs, top_k_indices = torch.topk(gate_probs, min(self.top_k, self.num_experts), dim=1)
         
         # Renormalizar as probabilidades top-k
         top_k_probs = top_k_probs / top_k_probs.sum(dim=1, keepdim=True)
@@ -908,114 +1261,248 @@ class GatingNetwork(nn.Module):
         return top_k_probs, top_k_indices, gate_probs
 
 class MoELayer(nn.Module):
-    """Camada Mixture of Experts com 6 especialistas e top-2"""
-    def __init__(self, input_dim, hidden_dim, output_dim, num_experts=6, top_k=2):
+    """Camada Mixture of Experts com balanceamento melhorado"""
+    def __init__(self, input_dim, hidden_dim, output_dim, num_experts=12, top_k=4):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.input_dim = input_dim
         self.output_dim = output_dim
-        
-        # Criar os especialistas
+
+        # Criar os especialistas com inicialização diversificada
         self.experts = nn.ModuleList([
             ExpertNetwork(input_dim, hidden_dim, output_dim) 
             for _ in range(num_experts)
         ])
-        
-        # Rede de gating
+
+        # Rede de gating melhorada
         self.gate = GatingNetwork(input_dim, num_experts, top_k)
-        
-        # Para regularização: loss de balanceamento
-        self.load_balancing_loss_coef = 0.01
-        
+
+        # Coeficiente de balanceamento mais alto para forçar melhor distribuição
+        self.load_balancing_loss_coef = 0.05
+
         # Métricas para monitoramento
         self.last_gate_probs = None
         self.expert_usage_history = []
+
+        # Variável para controlar noise dinâmico
+        self.noise_scale = 0.2
     
     def forward(self, x):
         batch_size = x.shape[0]
         
-        # Obter decisões do gate
+        # Adicionar ruído aos inputs para forçar especialização
+        if self.training:
+            # Aplicar noise dependendo do nível de desbalanceamento
+            stats = self.get_expert_usage_stats()
+            if stats['coefficient_of_variation'] > 0.8:  # Desbalanceamento alto
+                self.noise_scale = min(self.noise_scale * 1.05, 0.3)  # Aumenta noise gradualmente
+            else:
+                self.noise_scale = max(self.noise_scale * 0.98, 0.05)  # Reduz noise gradualmente
+
+            noise = torch.randn_like(x) * self.noise_scale
+            x = x + noise
+
+        # Obter decisões do gate com tokens de routing
         top_k_probs, top_k_indices, gate_probs = self.gate(x)
-        
+
         # Armazenar para monitoramento
         self.last_gate_probs = gate_probs.detach()
-        
-        # Calcular saídas dos especialistas selecionados
-        expert_outputs = []
-        for i in range(batch_size):
-            batch_expert_outputs = []
-            for j in range(self.top_k):
-                expert_idx = top_k_indices[i, j].item()
-                expert_output = self.experts[expert_idx](x[i:i+1])
-                batch_expert_outputs.append(expert_output)
-            expert_outputs.append(torch.stack(batch_expert_outputs, dim=1))
-        
-        expert_outputs = torch.cat(expert_outputs, dim=0)  # [batch_size, top_k, output_dim]
-        
-        # Combinar saídas com base nas probabilidades do gate
-        top_k_probs = top_k_probs.unsqueeze(-1)  # [batch_size, top_k, 1]
-        final_output = (expert_outputs * top_k_probs).sum(dim=1)  # [batch_size, output_dim]
-        
-        # Calcular loss de balanceamento (para regularização)
+
+        # Calcular saídas dos especialistas selecionados com processamento em paralelo
+        final_output = torch.zeros(batch_size, self.output_dim, device=x.device)
+
+        # Processar expert por expert (mais eficiente em GPU)
+        for expert_idx in range(self.num_experts):
+            # Encontrar quais amostras usam este especialista
+            batch_indices = []
+            for i in range(batch_size):
+                if expert_idx in top_k_indices[i]:
+                    # Encontrar posição do especialista no top_k
+                    pos = (top_k_indices[i] == expert_idx).nonzero(as_tuple=True)[0]
+                    batch_indices.append((i, pos.item()))
+
+            if batch_indices:  # Se este especialista está sendo usado
+                # Extrair índices e pesos
+                indices = [b[0] for b in batch_indices]
+                positions = [b[1] for b in batch_indices]
+
+                # Processar entrada apenas para este especialista
+                expert_input = x[indices]
+                expert_output = self.experts[expert_idx](expert_input)
+
+                # Aplicar pesos e adicionar ao resultado final
+                for idx, pos, out in zip(indices, positions, expert_output):
+                    weight = top_k_probs[idx, pos]
+                    final_output[idx] += weight * out
+
+        # Calcular loss de balanceamento com fator adaptativo
         load_balancing_loss = self._calculate_load_balancing_loss(gate_probs)
+
+        # Adicionar regularização para os especialistas menos utilizados
+        expert_usage = gate_probs.mean(dim=0)  # [num_experts]
+        if self.training and torch.max(expert_usage) > 0.3:
+            # Identificar especialistas menos usados
+            underused = expert_usage < 0.05
+            if underused.any():
+                # Adicionar penalty por especialistas subutilizados
+                underused_penalty = (0.05 - expert_usage[underused]).sum() * 0.5
+                load_balancing_loss = load_balancing_loss + underused_penalty
         
         return final_output, load_balancing_loss, gate_probs
     
     def _calculate_load_balancing_loss(self, gate_probs):
-        """Calcular loss de balanceamento melhorado"""
+        """Calcular loss de balanceamento com múltiplas estratégias"""
         # Frequência de uso de cada especialista
         expert_usage = gate_probs.mean(dim=0)  # [num_experts]
-        
-        # Calcula múltiplos tipos de loss para melhor balanceamento
-        
-        # 1. Loss de divergência KL da distribuição uniforme
-        uniform_prob = 1.0 / self.num_experts
+
+        # Cálculo de estatísticas para análise adaptativa
+        max_usage = expert_usage.max().item()
+        min_usage = expert_usage.min().item()
+        std_usage = expert_usage.std().item()
+        ideal_usage = 1.0 / self.num_experts
+
+        # 1. Loss de divergência KL da distribuição uniforme (mais forte)
+        uniform_prob = torch.full_like(expert_usage, ideal_usage)
         kl_loss = F.kl_div(
             torch.log(expert_usage + 1e-8),
-            torch.full_like(expert_usage, uniform_prob),
+            uniform_prob,
             reduction='sum'
         )
-        
-        # 2. Loss de variância (penaliza especialistas muito usados ou pouco usados)
-        variance_loss = expert_usage.var()
-        
+
+        # 2. Loss de variância quadrática (penaliza especialistas muito usados)
+        variance_loss = ((expert_usage - ideal_usage).pow(2)).mean()
+
         # 3. Loss de entropia (encoraja diversidade)
         entropy = -(expert_usage * torch.log(expert_usage + 1e-8)).sum()
-        max_entropy = -torch.log(torch.tensor(1.0/self.num_experts)) * self.num_experts
+        max_entropy = -math.log(ideal_usage) * self.num_experts
         entropy_loss = max_entropy - entropy
-        
-        # Combinar os diferentes tipos de loss
+
+        # 4. Loss de desigualdade (penaliza diferenças extremas entre especialistas)
+        inequality_loss = (max_usage - min_usage) * 2.0
+
+        # 5. Loss de quantil (penaliza o uso excessivo dos top experts)
+        top_usage, _ = torch.topk(expert_usage, k=self.num_experts//3)
+        quantile_loss = top_usage.mean() * 2.0  # Penaliza uso excessivo do top terço
+
+        # Pesos adaptativos baseados no nível de desbalanceamento
+        # Ajuste pesos para priorizar diferentes tipos de loss dependendo do estado atual
+        if max_usage > 0.3:  # Desbalanceamento severo
+            # Priorizar equalização e desigualdade
+            weights = [0.3, 0.25, 0.1, 0.25, 0.1]  # kl, var, entropy, inequality, quantile
+        elif std_usage > 0.05:  # Desbalanceamento moderado
+            # Balancear todos os tipos
+            weights = [0.25, 0.2, 0.2, 0.2, 0.15]
+        else:  # Balanceamento razoável
+            # Manter balanceamento estável
+            weights = [0.2, 0.15, 0.3, 0.15, 0.2]
+
+        # Combinar os diferentes tipos de loss com pesos adaptativos
         total_loss = (
-            0.5 * kl_loss + 
-            0.3 * variance_loss + 
-            0.2 * entropy_loss
+            weights[0] * kl_loss + 
+            weights[1] * variance_loss + 
+            weights[2] * entropy_loss +
+            weights[3] * inequality_loss +
+            weights[4] * quantile_loss
         )
-        
-        return self.load_balancing_loss_coef * total_loss
+
+        # Registrar métricas para monitoramento
+        self.expert_usage_history.append(expert_usage.detach().cpu().numpy())
+        if len(self.expert_usage_history) > 100:  # Manter apenas histórico recente
+            self.expert_usage_history.pop(0)
+
+        # Fator adaptativo baseado no desbalanceamento
+        adaptive_factor = 1.0
+        if max_usage > 0.4:  # Desbalanceamento extremo
+            adaptive_factor = 2.0
+        elif max_usage > 0.25:  # Desbalanceamento significativo
+            adaptive_factor = 1.5
+
+        return self.load_balancing_loss_coef * total_loss * adaptive_factor
     
     def get_expert_usage_stats(self):
-        """Retorna estatísticas detalhadas sobre o uso dos especialistas"""
+        """Retorna estatísticas detalhadas sobre o uso dos especialistas com métricas avançadas"""
         if self.last_gate_probs is not None:
             usage = self.last_gate_probs.mean(dim=0).cpu().numpy()
-            
+
             # Evitar divisão por zero
             if np.any(np.isnan(usage)) or np.any(usage <= 0):
                 usage = np.full(self.num_experts, 1.0/self.num_experts)
-            
-            return {
+
+            # Calcular estatísticas históricas se disponível
+            historical_stats = {}
+            if len(self.expert_usage_history) > 5:  # Se temos histórico suficiente
+                historical_usage = np.stack(self.expert_usage_history[-10:], axis=0).mean(axis=0)
+                historical_stats = {
+                    'historical_usage': historical_usage,
+                    'historical_max': float(np.max(historical_usage)),
+                    'historical_min': float(np.min(historical_usage))
+                }
+
+            # Detectar especialistas inativos (< 1% de uso)
+            inactive_count = np.sum(usage < 0.01)
+            inactive_indices = np.where(usage < 0.01)[0].tolist()
+
+            # Detectar especialistas dominantes (> 20% de uso)
+            dominant_count = np.sum(usage > 0.2)
+            dominant_indices = np.where(usage > 0.2)[0].tolist()
+
+            # Índices de especialistas ordenados por uso
+            sorted_indices = np.argsort(usage)[::-1].tolist()
+
+            # Calcular índice de Gini para medir desigualdade
+            sorted_usage = np.sort(usage)
+            cumulative_usage = np.cumsum(sorted_usage)
+            gini = 1 - 2 * np.sum(cumulative_usage) / (len(usage) * cumulative_usage[-1])
+
+            # Métricas de balanceamento
+            entropy = -np.sum(usage * np.log(usage + 1e-8))
+            max_entropy = -np.log(1.0/self.num_experts) * self.num_experts
+            normalized_entropy = entropy / max_entropy
+
+            # Quartis de uso
+            quartiles = np.percentile(usage, [25, 50, 75])
+
+            stats = {
                 'usage': usage,
                 'max_usage': float(np.max(usage)),
                 'min_usage': float(np.min(usage)),
+                'median_usage': float(np.median(usage)),
                 'std_usage': float(np.std(usage)),
-                'coefficient_of_variation': float(np.std(usage) / (np.mean(usage) + 1e-8))
+                'coefficient_of_variation': float(np.std(usage) / (np.mean(usage) + 1e-8)),
+                'inactive_count': int(inactive_count),
+                'inactive_experts': inactive_indices,
+                'dominant_count': int(dominant_count),
+                'dominant_experts': dominant_indices,
+                'top_experts': sorted_indices[:3],  # Top 3 experts
+                'bottom_experts': sorted_indices[-3:],  # Bottom 3 experts
+                'gini_coefficient': float(gini),  # Índice de desigualdade
+                'normalized_entropy': float(normalized_entropy),  # 1.0 é perfeito
+                'quartiles': quartiles.tolist(),  # 25%, 50%, 75%
+                'noise_scale': self.noise_scale  # Nível atual de ruído
             }
+
+            # Adicionar estatísticas históricas se disponíveis
+            if historical_stats:
+                stats.update(historical_stats)
+
+            return stats
+
+        # Valores padrão para o caso de não termos dados ainda
+        default_usage = np.full(self.num_experts, 1.0/self.num_experts)
         return {
-            'usage': np.full(self.num_experts, 1.0/self.num_experts),
+            'usage': default_usage,
             'max_usage': 1.0/self.num_experts,
             'min_usage': 1.0/self.num_experts,
             'std_usage': 0.0,
-            'coefficient_of_variation': 0.0
+            'coefficient_of_variation': 0.0,
+            'inactive_count': 0,
+            'inactive_experts': [],
+            'dominant_count': 0,
+            'dominant_experts': [],
+            'gini_coefficient': 0.0,
+            'normalized_entropy': 1.0,
+            'noise_scale': self.noise_scale
         }
 
 # Apply Wrappers to environment
@@ -1045,8 +1532,25 @@ try:
         mario.vida_inicial = 2
         mario.max_pos = 0
         
+        # Verificar balanceamento no início do episódio a cada 5 episódios
+        if e > 0 and e % 5 == 0:
+            moe_metrics = mario.net.get_moe_metrics()
+            if moe_metrics and 'expert_usage' in moe_metrics:
+                max_usage = max(moe_metrics['expert_usage'])
+                # Verificação de balanceamento no início do episódio
+                if max_usage > 0.3:
+                    mario.console.print(f"[bold yellow]⚠️ Iniciando episódio {e} com desbalanceamento (max: {max_usage:.2f})[/bold yellow]")
+                    mario.check_expert_dominance()  # Forçar verificação de dominância
+
+                    # Se desbalanceamento for muito grave, reinicializar gate
+                    if max_usage > 0.4 and e % 20 == 0:
+                        mario.reinitialize_gate_network()
+
         # Play the game!
+        episode_steps = 0
         while True:
+            episode_steps += 1
+
             # Run agent on the state
             action = mario.act(state)
 
@@ -1062,7 +1566,20 @@ try:
             # Logging
             moe_metrics = mario.net.get_moe_metrics()
             logger.log_step(reward, loss, q, moe_metrics)
-            
+
+            # Verificar balanceamento periodicamente durante episódios longos
+            if episode_steps > 0 and episode_steps % 200 == 0 and mario.curr_step > 1000:
+                if moe_metrics and 'expert_usage' in moe_metrics:
+                    max_usage = max(moe_metrics['expert_usage'])
+                    inactive_count = sum(1 for usage in moe_metrics['expert_usage'] if usage < 0.01)
+
+                    # Log para o console
+                    mario.console.print(f"[cyan]📊 Ep {e}, Step {episode_steps}: max usage={max_usage:.2f}, {inactive_count} experts inativos[/cyan]")
+
+                    # Verificação de balanceamento durante o episódio
+                    if max_usage > 0.35 or inactive_count > mario.net.moe_layer.num_experts // 3:
+                        mario.check_expert_dominance()
+
             # Atualizar tabela a cada 50 steps para ver progresso em tempo real
             if mario.curr_step % 50 == 0:
                 logger.update_live_display(e, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
@@ -1076,28 +1593,29 @@ try:
 
         # Coletar métricas MoE finais do episódio
         moe_metrics = mario.net.get_moe_metrics()
-        
+
         # Atualizar display live com informações finais do episódio ANTES de resetar
         logger.update_live_display(e, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
-        
+
+        # Imprimir estatísticas detalhadas do MoE a cada 10 episódios
+        if e % 10 == 0:
+            mario.print_moe_stats(e)
+
         # Pequena pausa para garantir que a atualização seja visível
         import time
         time.sleep(0.1)
-        
+
         # Marcar fim do episódio (isso reseta as métricas do episódio atual)
         logger.log_episode()
 
         # Forçar uma segunda atualização do display após log_episode para mostrar o episódio completado
         logger.update_live_display(e+1, moe_metrics, mario.net, mario.exploration_rate, mario.curr_step)
 
-        # Imprimir estatísticas do MoE a cada 10 episódios (em console separado) - DESABILITADO: agora na tabela Rich
-        # if e % 10 == 0:
-        #     mario.print_moe_stats(e)
-
-        if e % 20 == 0:
+        # Salvar a cada 20 episódios ou quando houver progresso significativo
+        if e % 20 == 0 or (len(logger.ep_rewards) > 0 and logger.ep_rewards[-1] > max(logger.ep_rewards[:-1], default=0)):
             logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step, moe_metrics=moe_metrics, mario_net=mario.net)
-
-        mario.save()
+            mario.save()
+            mario.console.print(f"[bold green]💾 Progresso salvo no episódio {e}[/bold green]")
 
 finally:
     # Stop live display when training finishes
