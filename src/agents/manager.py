@@ -1,5 +1,6 @@
-from config import NUM_AGENTS
-from agent import Agent  # Supondo que você tenha uma classe Agent definida em agent.py
+import pickle
+from src.helpers.config import NUM_AGENTS
+from src.agents.agent import Mario as Agent  # Using Mario as the Agent class
 
 class AgentManager:
     def __init__(self):
