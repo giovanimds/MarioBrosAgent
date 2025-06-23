@@ -1,11 +1,11 @@
 from pathlib import Path
 
 # Agent configuration
-NUM_AGENTS = 6  # Number of agents to run in parallel
+NUM_AGENTS = 4  # Number of agents to run in parallel
 
 # Environment configuration
 GAME_ID = "SuperMarioBros-v0"  # Game ID for gym_super_mario_bros
-RENDER_MODE = "human"  # "human" for visualization, "rgb_array" for headless
+RENDER_MODE = None  # "human" for visualization, "rgb_array" for headless
 SKIP_FRAMES = 4  # Number of frames to skip in the SkipFrame wrapper
 FRAME_SHAPE = (84, 84)  # Shape to resize observations to
 NUM_STACK = 4  # Number of frames to stack
