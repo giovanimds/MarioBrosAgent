@@ -6,6 +6,7 @@ Este módulo fornece configurações otimizadas para diferentes objetivos de tre
 
 from dataclasses import dataclass
 from src.env_manager.reward_wrapper import RewardConfig
+from src.env_manager.exploration_wrapper import ExplorationConfig
 
 
 @dataclass
@@ -232,6 +233,96 @@ CURRICULUM_CONFIG = RewardConfig(
     }
 )
 
+# Configurações para Exploração Máxima (ExplorationConfig)
+# Estas configurações são para o ExplorationRewardWrapper
+
+EXPLORATION_MAX_CONFIG = ExplorationConfig(
+    # Recompensas por exploração - ALTÍSSIMAS
+    new_cell_reward=1.0,          # Recompensa por visitar célula nova
+    secret_area_reward=25.0,     # Recompensa por área secreta (MUITO ALTA!)
+    hidden_coin_reward=5.0,      # Recompensa por moeda escondida
+    powerup_reward=20.0,         # Recompensa por power-up
+    
+    # Recompensas por novelty
+    novelty_reward=0.5,          # Recompensa por estado novo
+    novelty_decay=0.995,        # Decaimento lento da novelty
+    
+    # Recompensas por rotas secretas
+    secret_path_reward=50.0,     # Recompensa por descobrir rota secreta (MUITO ALTA!)
+    path_diversity_reward=10.0,  # Recompensa por diversidade de caminhos
+    
+    # Parâmetros de detecção
+    grid_cell_size=8,            # Grid mais fino para detecção precisa
+    min_secret_area_size=2,      # Áreas secretas menores
+    novelty_threshold=0.05,     # Threshold mais baixo para novelty
+    
+    # Parâmetros de rotas secretas
+    min_path_length=5,           # Caminhos mais curtos também contam
+    path_similarity_threshold=0.7,  # Similaridade mais baixa para considerar diferente
+    
+    # Recompensas por curiosidade intrínseca
+    intrinsic_reward_scale=0.2,  # Mais recompensa por curiosidade
+    prediction_error_reward=0.5, # Recompensa por erro de previsão
+    
+    # Parâmetros de decaimento
+    exploration_decay=0.9995,    # Decaimento muito lento
+    min_exploration_reward=0.05, # Recompensa mínima mais alta
+    
+    # Normalização
+    max_exploration_reward=50.0,  # Limite máximo alto
+    
+    # Tudo ativo
+    enable_visitation_grid=True,
+    enable_novelty_detection=True,
+    enable_secret_detection=True,
+    enable_path_diversity=True,
+    enable_intrinsic_motivation=True
+)
+
+# Configuração para descoberta de segredos
+SECRET_HUNTER_CONFIG = ExplorationConfig(
+    # Recompensas por exploração
+    new_cell_reward=0.3,
+    secret_area_reward=50.0,     # Recompensa ENORME por área secreta!
+    hidden_coin_reward=10.0,     # Recompensa alta por moedas escondidas
+    powerup_reward=30.0,         # Recompensa alta por power-ups
+    
+    # Recompensas por novelty
+    novelty_reward=0.2,
+    novelty_decay=0.99,
+    
+    # Recompensas por rotas secretas
+    secret_path_reward=100.0,    # Recompensa EXTREMA por rota secreta!
+    path_diversity_reward=5.0,
+    
+    # Parâmetros de detecção
+    grid_cell_size=16,
+    min_secret_area_size=3,
+    novelty_threshold=0.1,
+    
+    # Parâmetros de rotas secretas
+    min_path_length=10,
+    path_similarity_threshold=0.8,
+    
+    # Recompensas por curiosidade intrínseca
+    intrinsic_reward_scale=0.1,
+    prediction_error_reward=0.2,
+    
+    # Parâmetros de decaimento
+    exploration_decay=0.999,
+    min_exploration_reward=0.01,
+    
+    # Normalização
+    max_exploration_reward=100.0,  # Limite máximo muito alto
+    
+    # Tudo ativo
+    enable_visitation_grid=True,
+    enable_novelty_detection=True,
+    enable_secret_detection=True,
+    enable_path_diversity=True,
+    enable_intrinsic_motivation=True
+)
+
 # Lista de todos os presets disponíveis
 REWARD_PRESETS = {
     'fast_learning': RewardPreset(
@@ -271,6 +362,20 @@ REWARD_PRESETS = {
     )
 }
 
+# Presets para Exploração (ExplorationConfig)
+EXPLORATION_PRESETS = {
+    'exploration_max': {
+        'name': 'Exploration Max',
+        'description': 'Exploração MÁXIMA! Recompensas generosas por descobrir áreas novas, segredos e rotas alternativas',
+        'config': EXPLORATION_MAX_CONFIG
+    },
+    'secret_hunter': {
+        'name': 'Secret Hunter',
+        'description': 'Caçador de segredos! Recompensas ENORMES por descobrir áreas secretas, moedas escondidas e power-ups',
+        'config': SECRET_HUNTER_CONFIG
+    }
+}
+
 
 def get_reward_preset(name: str) -> RewardConfig:
     """
@@ -290,18 +395,63 @@ def get_reward_preset(name: str) -> RewardConfig:
         return BALANCED_CONFIG
 
 
+def get_exploration_preset(name: str) -> ExplorationConfig:
+    """
+    Retorna a configuração de exploração com base no nome do preset.
+    
+    Args:
+        name: Nome do preset ('exploration_max', 'secret_hunter')
+        
+    Returns:
+        Configuração de exploração
+    """
+    preset = EXPLORATION_PRESETS.get(name)
+    if preset:
+        return preset['config']
+    else:
+        # Retornar configuração de exploração máxima como padrão
+        return EXPLORATION_MAX_CONFIG
+
+
 def list_reward_presets() -> list:
-    """Retorna a lista de todos os presets disponíveis"""
+    """Retorna a lista de todos os presets disponíveis (RewardConfig)"""
     return list(REWARD_PRESETS.keys())
 
 
+def list_exploration_presets() -> list:
+    """Retorna a lista de todos os presets de exploração disponíveis"""
+    return list(EXPLORATION_PRESETS.keys())
+
+
 def get_preset_info(name: str) -> dict:
-    """Retorna informações sobre um preset específico"""
+    """Retorna informações sobre um preset específico (RewardConfig)"""
     preset = REWARD_PRESETS.get(name)
     if preset:
         return {
             'name': preset.name,
             'description': preset.description,
-            'config': preset.config
+            'config': preset.config,
+            'type': 'RewardConfig'
         }
     return {}
+
+
+def get_exploration_preset_info(name: str) -> dict:
+    """Retorna informações sobre um preset de exploração específico"""
+    preset = EXPLORATION_PRESETS.get(name)
+    if preset:
+        return {
+            'name': preset['name'],
+            'description': preset['description'],
+            'config': preset['config'],
+            'type': 'ExplorationConfig'
+        }
+    return {}
+
+
+def list_all_presets() -> dict:
+    """Retorna todos os presets disponíveis (RewardConfig e ExplorationConfig)"""
+    return {
+        'reward_presets': list_reward_presets(),
+        'exploration_presets': list_exploration_presets()
+    }

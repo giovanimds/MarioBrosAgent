@@ -1,6 +1,7 @@
 # env_manager package
 from src.env_manager.environment import (
     create_env,
+    create_exploration_env,
     get_action_meaning,
     get_available_games,
     DEFAULT_REWARD_CONFIG,
@@ -20,10 +21,19 @@ from src.env_manager.reward_wrapper import (
     RewardState,
     create_reward_wrapper
 )
+from src.env_manager.exploration_wrapper import (
+    ExplorationRewardWrapper,
+    SecretRewardWrapper,
+    CompositeExplorationWrapper,
+    ExplorationConfig,
+    ExplorationState,
+    create_exploration_wrapper
+)
 
 __all__ = [
     # Environment
     'create_env',
+    'create_exploration_env',
     'get_action_meaning',
     'get_available_games',
     'DEFAULT_REWARD_CONFIG',
@@ -39,5 +49,12 @@ __all__ = [
     'CompositeRewardWrapper',
     'RewardConfig',
     'RewardState',
-    'create_reward_wrapper'
+    'create_reward_wrapper',
+    # Exploration Wrappers
+    'ExplorationRewardWrapper',
+    'SecretRewardWrapper',
+    'CompositeExplorationWrapper',
+    'ExplorationConfig',
+    'ExplorationState',
+    'create_exploration_wrapper'
 ]
