@@ -67,7 +67,7 @@ class FixedMBPTrainer:
         
         # Target network for DQN-style training
         self.target_network = FixedMBPNetwork(config)
-        self.target_network.load_state_dict(network.state_dict())
+        self.target_network.load_state_dict({"state_dict": network.state_dict(), "step_count": 0, "total_surprise": 0.0, "average_surprise": 0.0})
         self.target_network.eval()
         
         # Sync interval

@@ -407,7 +407,7 @@ class FixedMBPNetwork(nn.Module):
     
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load network state from dictionary."""
-        self.load_state_dict(state_dict["state_dict"])
+        nn.Module.load_state_dict(self, state_dict["state_dict"])
         self.step_count = state_dict.get("step_count", 0)
         self.total_surprise = state_dict.get("total_surprise", 0.0)
         self.average_surprise = state_dict.get("average_surprise", 0.0)
