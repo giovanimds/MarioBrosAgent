@@ -103,8 +103,11 @@ class FixedMBPAgent:
         Returns:
             Action index
         """
-        # Convert state to tensor
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
+        # Convert state to tensor (handle if already a tensor from wrappers)
+        if isinstance(state, torch.Tensor):
+            state_tensor = state.float().to(self.device)
+        else:
+            state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
         
         # Epsilon-greedy
         if np.random.rand() < self.exploration_rate:
@@ -136,9 +139,14 @@ class FixedMBPAgent:
             done: Whether episode is done
             info: Additional info
         """
-        # Convert to tensors
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
-        next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+        # Convert to tensors (handle if already tensors from wrappers)
+        def to_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.float().to(self.device)
+            return torch.tensor(x, dtype=torch.float32, device=self.device)
+        
+        state_tensor = to_tensor(state)
+        next_state_tensor = to_tensor(next_state)
         action_tensor = torch.tensor([action], dtype=torch.int64, device=self.device)
         reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device)
         done_tensor = torch.tensor([done], dtype=torch.float32, device=self.device)
